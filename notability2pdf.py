@@ -5,6 +5,7 @@ from notability2pdf_lib.cli import default_output_dir, default_output_path, main
 from notability2pdf_lib.constants import (
     DEFAULT_CONTENT_INSET_RATIO,
     DEFAULT_EXPORT_WIDTH_PT,
+    DEFAULT_INPUT_DIR,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_PAGE_COLOR,
     DEFAULT_PAGE_RATIO,
@@ -66,6 +67,7 @@ from notability2pdf_lib.vector_pdf import write_svg_pages, write_vector_pdf
 __all__ = [
     "DEFAULT_CONTENT_INSET_RATIO",
     "DEFAULT_EXPORT_WIDTH_PT",
+    "DEFAULT_INPUT_DIR",
     "DEFAULT_OUTPUT_DIR",
     "DEFAULT_PAGE_COLOR",
     "DEFAULT_PAGE_RATIO",

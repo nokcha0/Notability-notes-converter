@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from .constants import DEFAULT_OUTPUT_DIR
+from .constants import DEFAULT_INPUT_DIR, DEFAULT_OUTPUT_DIR
 from .converter import convert_note_folder_to_pdfs, convert_note_to_pdf
 
 
@@ -12,12 +13,17 @@ def default_output_path(input_path: Path) -> Path:
 
 
 def default_output_dir(input_path: Path) -> Path:
-    return Path(DEFAULT_OUTPUT_DIR) / input_path.name
+    return Path(DEFAULT_OUTPUT_DIR)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert Notability .note bundles into PDFs.")
-    parser.add_argument("input", type=Path, help="Path to the source .note file or folder")
+    parser.add_argument(
+        "input",
+        type=Path,
+        nargs="?",
+        help=f"Path to the source .note file or folder (default: {DEFAULT_INPUT_DIR}/)",
+    )
     parser.add_argument(
         "output",
         type=Path,
@@ -43,9 +49,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    input_path = args.input
+def run(args: argparse.Namespace) -> int:
+    using_default_input = args.input is None
+    input_path = args.input or Path(DEFAULT_INPUT_DIR)
+    if not input_path.exists():
+        if using_default_input:
+            input_path.mkdir(parents=True, exist_ok=True)
+            print(f"Created {input_path}; add .note files there, then run again.")
+            return 0
+        raise FileNotFoundError(f"Input path does not exist: {input_path}")
+
     if input_path.is_dir():
         output_dir = args.output or default_output_dir(input_path)
         written_paths = convert_note_folder_to_pdfs(
@@ -55,7 +68,7 @@ def main() -> int:
             raster=args.raster,
             keep_svg=args.keep_svg,
         )
-        print(f"Wrote {len(written_paths)} PDF(s) to {output_dir}")
+        print(f"Mirrored {len(written_paths)} file(s) to {output_dir}")
         return 0
 
     output_path = args.output or default_output_path(input_path)
@@ -67,3 +80,11 @@ def main() -> int:
     if svg_dir is not None:
         print(f"Wrote SVG overlays to {svg_dir}")
     return 0
+
+
+def main() -> int:
+    try:
+        return run(parse_args())
+    except (FileExistsError, FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
