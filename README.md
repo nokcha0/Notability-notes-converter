@@ -1,5 +1,19 @@
 # Notability `.note` Converter
 
+Converts `.note` to `.pdf` by default, or optionally to `.svg`
+
+Initially made for personal use as I couldn't find a reliable converter online. I hope this is useful for someone.
+
+## Where is this useful?
+
+- Convert `.note` to other file formats in bulk (with high speed)
+- View `.note` files on a machine without Notability
+- Switch platforms `.note` -> `.svg` (SVGs can be imported in other note taking apps as editable files)
+
+## How to use
+
+Requirements: Rust
+
 Put your exported `.note` files under `input/`, then run this from the repo root:
 
 ```bash
@@ -7,56 +21,66 @@ cargo run
 ```
 
 That converts everything under `input/` into `output/`.
-
-## Optional Output Folder
-
-If you want a different output folder:
-
-```bash
-cargo run -- --output my-output
-```
-
-Short form:
-
-```bash
-cargo run -- -o my-output
-```
-
-## Folder Behavior
-
-- Input is always `input/`
-- Default output is `output/`
-- The output tree mirrors the input tree
-- Every `.note` file becomes a `.pdf`
-- Non-note files are copied as-is
-- The output folder is regenerated on each run so stale files do not remain
-
+Nested folder structures are respected.
 Example:
 
 ```text
-input/Semester 1/Week 1/Lecture.note
-input/Semester 1/Week 1/handout.txt
-input/Semester 1/Week 2/Review.note
+.
+├── input/
+│   ├── example1.note
+│   └── example_folder/
+│       └── example2.note
+└── output/
+    ├── example1.pdf
+    └── example_folder/
+        └── example2.pdf
 ```
 
-becomes:
+## Optional Flags: Format, Input / Output Folder
 
-```text
-output/Semester 1/Week 1/Lecture.pdf
-output/Semester 1/Week 1/handout.txt
-output/Semester 1/Week 2/Review.pdf
+```bash
+cargo run -- --format svg --input path/to/input --output path/to/output
 ```
 
-If `input/` does not exist yet, the first run creates it and stops so you can drop files into it.
+## Analysis of .note file format
 
-## What It Parses
+Thanks to [Julia Evans' blog](https://jvns.ca/blog/2018/03/31/reverse-engineering-notability-format/), I was able to quickly grasp how the file format works.
 
-The converter treats `.note` as a ZIP bundle and reads `Session.plist` to reconstruct:
+A `.note` file is a ZIP archive.
 
-- ruled paper backgrounds
-- typed text
-- embedded image media objects
-- imported PDF pages
-- handwriting strokes
+- `Session.plist`: the main document object graph
+- `PDFs/`: imported PDF source files
+- image assets referenced by embedded figures
+- thumbnail PNGs for page aspect ratio fallback
 
-It is tuned against the sample notes in this repo and emits vector PDF output from Rust.
+`Session.plist` is not a flat plist. It is an Apple keyed archive with `$objects` and `$top`, so decoding it requires following UID references through the object table.
+
+The main content is stored under:
+
+- `richText`: the main content container
+- `richText -> reflowState`: carries layout information such as `pageWidthInDocumentCoordsKey`
+- `richText -> attributedString`: stores the plain text and style subranges
+- `richText -> mediaObjects`: stores placed images with document coordinates, size, and z-order
+- `richText -> pageLayoutArray`: maps note pages to imported PDF files and source page indices
+- `richText -> Handwriting Overlay -> SpatialHash`: stores the pen stroke payloads
+
+The handwriting payload in `SpatialHash` is mostly little-endian binary arrays:
+
+- `curvespoints`: `f32` pairs representing stroke points
+- `curvesnumpoints`: `i32` point counts for each stroke
+- `curveswidth`: base stroke widths as `f32`
+- `curvesforces`: pressure samples as `f32`
+- `curvesfractionalwidths`: width multipliers as `f32`
+- `curvescolors`: RGBA bytes
+- `curvesstyles`: per-stroke tool/style identifiers
+
+Many strokes follow a cubic Bezier layout where the point count matches `1 + 3n`, so the data is not just a plain polyline list.
+
+Page geometry is reconstructed from:
+
+- explicit document width from `reflowState`
+- imported PDF page boxes when the note is PDF-backed
+- thumbnail aspect ratio as a fallback when no embedded PDF page defines the height
+- paper attributes such as line style, paper size, and sizing behavior
+
+That is enough to reconstruct the sample notes.
