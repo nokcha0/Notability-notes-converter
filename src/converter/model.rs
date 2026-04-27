@@ -28,6 +28,7 @@ impl OutputFormat {
 pub(crate) struct TextStyle {
     pub(crate) font_size: f32,
     pub(crate) font_name: String,
+    pub(crate) line_spacing_multiplier: f32,
     pub(crate) color: [u8; 4],
     pub(crate) bold: bool,
     pub(crate) italic: bool,

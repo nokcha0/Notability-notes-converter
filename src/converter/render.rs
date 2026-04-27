@@ -439,7 +439,7 @@ fn draw_text_content(
     let mut cursor_x_doc = 0.0f32;
     let mut cursor_y_doc = 0.0f32;
     let mut at_line_start = true;
-    let mut line_max_font_size = 0.0f32;
+    let mut line_height_doc = 0.0f32;
     let styles = build_style_map_for(text, text_spans);
     for (char_index, ch) in text.chars().enumerate() {
         if ch == '\r' {
@@ -447,13 +447,13 @@ fn draw_text_content(
         }
         if ch == '\n' {
             cursor_x_doc = 0.0;
-            cursor_y_doc += text_line_advance_doc(line_spacing_doc, line_max_font_size);
-            line_max_font_size = 0.0;
+            cursor_y_doc += text_line_advance_doc(line_spacing_doc, line_height_doc);
+            line_height_doc = 0.0;
             at_line_start = true;
             continue;
         }
         let style = styles.get(char_index).cloned().unwrap_or_else(default_text_style);
-        line_max_font_size = line_max_font_size.max(style.font_size);
+        line_height_doc = line_height_doc.max(style.font_size * style.line_spacing_multiplier.max(1.0));
         if at_line_start {
             draw_pdf_list_marker(
                 operations,
@@ -471,8 +471,8 @@ fn draw_text_content(
         let char_width_doc = style.font_size * font_width_factor(&style, ch);
         if cursor_x_doc + char_width_doc > max_width_doc {
             cursor_x_doc = list_text_indent_doc(&style);
-            cursor_y_doc += text_line_advance_doc(line_spacing_doc, line_max_font_size);
-            line_max_font_size = style.font_size;
+            cursor_y_doc += text_line_advance_doc(line_spacing_doc, line_height_doc);
+            line_height_doc = style.font_size * style.line_spacing_multiplier.max(1.0);
         }
         let absolute_y_doc = origin_y_doc + cursor_y_doc;
         let page_index = (absolute_y_doc / page_height_doc).floor() as usize;
@@ -538,6 +538,7 @@ fn default_text_style() -> TextStyle {
     TextStyle {
         font_size: 12.0,
         font_name: "Helvetica".to_string(),
+        line_spacing_multiplier: 1.0,
         color: [0, 0, 0, 255],
         bold: false,
         italic: false,
@@ -551,20 +552,33 @@ fn default_text_style() -> TextStyle {
     }
 }
 
-fn text_line_advance_doc(line_spacing_doc: f32, max_font_size: f32) -> f32 {
-    line_spacing_doc.max(max_font_size * 1.18)
+fn text_line_advance_doc(line_spacing_doc: f32, line_height_doc: f32) -> f32 {
+    if line_height_doc <= 0.0 {
+        return line_spacing_doc;
+    }
+    let steps = (line_height_doc / line_spacing_doc.max(f32::EPSILON))
+        .ceil()
+        .max(1.0);
+    line_spacing_doc * steps
 }
 
 fn pdf_font_resource(style: &TextStyle) -> &'static str {
     let lower = style.font_name.to_ascii_lowercase();
-    let family = if lower.contains("times") {
+    let family = if lower.contains("times")
+        || lower.contains("baskerville")
+        || lower.contains("alnile")
+        || lower.contains("serif")
+    {
         "times"
+    } else if lower.contains("chalkduster") {
+        "courier"
     } else if lower.contains("typewriter") || lower.contains("courier") || lower.contains("mono") {
         "courier"
     } else {
         "helvetica"
     };
-    match (family, style.bold, style.italic) {
+    let bold = style.bold || lower.contains("impact") || lower.contains("chalkduster");
+    match (family, bold, style.italic) {
         ("times", true, true) => "FTimesBI",
         ("times", true, false) => "FTimesB",
         ("times", false, true) => "FTimesI",
@@ -622,6 +636,7 @@ fn draw_pdf_list_marker(
     let level = style.indent_level.unwrap_or(0);
     let x = (content_inset_doc + origin_x_doc + list_marker_x_doc(style)) * doc_to_pt;
     let y = export_height_pt - (cursor_y_doc * doc_to_pt + style.font_size * doc_to_pt * 0.62);
+    let baseline_y = export_height_pt - (cursor_y_doc * doc_to_pt + style.font_size * doc_to_pt);
     let radius = if decoration_style == 3 {
         (style.font_size * doc_to_pt * 0.32).max(2.2)
     } else {
@@ -640,7 +655,7 @@ fn draw_pdf_list_marker(
                 ],
             ),
             Operation::new("Tf", vec![pdf_font_resource(style).into(), (style.font_size * doc_to_pt).into()]),
-            Operation::new("Td", vec![x.into(), (y - radius * 1.3).into()]),
+            Operation::new("Td", vec![x.into(), baseline_y.into()]),
             Operation::new("Tj", vec![Object::string_literal(marker)]),
             Operation::new("ET", vec![]),
         ]);
@@ -698,28 +713,30 @@ fn draw_pdf_list_marker(
 fn list_marker_x_doc(style: &TextStyle) -> f32 {
     let level = style.indent_level.unwrap_or(0) as f32;
     match style.indent_decoration_style.unwrap_or(0) {
-        2 => level * 25.0,
-        3 => level * 22.0,
-        _ => 1.5 + level * 22.0,
+        0 => 0.0,
+        3 => level * 25.0,
+        _ => level * 25.0,
     }
 }
 
 fn list_text_indent_doc(style: &TextStyle) -> f32 {
     match style.indent_decoration_style.unwrap_or(0) {
         0 => 0.0,
-        2 => list_marker_x_doc(style) + 47.0,
-        3 => list_marker_x_doc(style) + 22.0,
-        _ => list_marker_x_doc(style) + 11.0,
+        2 => list_marker_x_doc(style) + style.font_size * 1.7,
+        3 => list_marker_x_doc(style) + style.font_size * 1.9,
+        _ => list_marker_x_doc(style) + style.font_size,
     }
 }
 
 fn list_number_marker(style: &TextStyle) -> String {
     let number = style.indent_decoration_number.unwrap_or(1).max(1);
-    match style.indent_level.unwrap_or(0) % 4 {
-        1 => format!("{}.", alpha_marker(number, true)),
-        2 => format!("{}.", alpha_marker(number, false)),
-        3 => format!("{number}."),
-        _ => format!("{number}."),
+    match style.indent_level.unwrap_or(0) {
+        0 => format!("{number}."),
+        level => match (level - 1) % 3 {
+            0 => format!("{}.", alpha_marker(number, true)),
+            1 => format!("{}.", alpha_marker(number, false)),
+            _ => format!("{number}."),
+        },
     }
 }
 
@@ -737,7 +754,11 @@ fn alpha_marker(number: i64, uppercase: bool) -> String {
 
 fn font_width_factor(style: &TextStyle, ch: char) -> f32 {
     let lower = style.font_name.to_ascii_lowercase();
-    if lower.contains("typewriter") || lower.contains("courier") || lower.contains("mono") {
+    if lower.contains("typewriter")
+        || lower.contains("courier")
+        || lower.contains("mono")
+        || lower.contains("chalkduster")
+    {
         0.6
     } else {
         helvetica_width_factor(ch)
@@ -917,6 +938,20 @@ fn draw_curves(
                     content_inset_doc,
                     page_height,
                 );
+            } else if curve.style != STROKE_STYLE_HIGHLIGHTER
+                && curve.dash_pattern.is_none()
+                && curve_has_variable_width(curve)
+            {
+                draw_pressure_pen_curve(
+                    operations,
+                    output,
+                    ext_gstates,
+                    ext_cache,
+                    curve,
+                    doc_to_pt,
+                    content_inset_doc,
+                    page_height,
+                );
             } else {
                 draw_pen_curve(
                     operations,
@@ -933,6 +968,16 @@ fn draw_curves(
     }
 }
 
+fn curve_has_variable_width(curve: &StrokeCurve) -> bool {
+    fn varies(values: &[f32]) -> bool {
+        let Some(first) = values.first() else {
+            return false;
+        };
+        values.iter().any(|value| (value - first).abs() > 0.03)
+    }
+    varies(&curve.pressures) || varies(&curve.fractional_widths)
+}
+
 fn draw_pen_curve(
     operations: &mut Vec<Operation>,
     output: &mut Document,
@@ -944,6 +989,12 @@ fn draw_pen_curve(
     page_height: f32,
 ) {
     if curve.points.is_empty() {
+        return;
+    }
+    if curve.style == STROKE_STYLE_HIGHLIGHTER
+        && curve.dash_pattern.is_some()
+        && curve_path_extent(curve) < curve.width * 0.25
+    {
         return;
     }
     let points = stroke_points_pt(curve, doc_to_pt, content_inset_doc, page_height);
@@ -965,6 +1016,79 @@ fn draw_pen_curve(
         operations.push(Operation::new("S", vec![]));
     }
     operations.push(Operation::new("Q", vec![]));
+}
+
+fn draw_pressure_pen_curve(
+    operations: &mut Vec<Operation>,
+    output: &mut Document,
+    ext_gstates: &mut Dictionary,
+    ext_cache: &mut BTreeMap<(u16, bool), String>,
+    curve: &StrokeCurve,
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+    page_height: f32,
+) {
+    if curve.points.len() < 2 {
+        return;
+    }
+    let points = stroke_points_pt(curve, doc_to_pt, content_inset_doc, page_height);
+    let gs = ext_gstate_name(
+        output,
+        ext_gstates,
+        ext_cache,
+        curve.rgba[3] as f32 / 255.0,
+        false,
+    );
+    if is_bezier_point_count(points.len()) {
+        let sample_count = ((points.len() - 1) / 3) + 1;
+        let pressures = resample_values(&curve.pressures, sample_count);
+        let fracs = resample_values(&curve.fractional_widths, sample_count);
+        for segment_index in 0..((points.len() - 1) / 3) {
+            let width = pen_width(
+                curve.width * doc_to_pt,
+                (pressures[segment_index] + pressures[segment_index + 1]) * 0.5,
+                (fracs[segment_index] + fracs[segment_index + 1]) * 0.5,
+            );
+            push_stroke_state(operations, curve, width, &gs);
+            let start = points[segment_index * 3];
+            let c1 = points[segment_index * 3 + 1];
+            let c2 = points[segment_index * 3 + 2];
+            let end = points[segment_index * 3 + 3];
+            operations.extend([
+                Operation::new("m", vec![start.0.into(), start.1.into()]),
+                Operation::new(
+                    "c",
+                    vec![
+                        c1.0.into(),
+                        c1.1.into(),
+                        c2.0.into(),
+                        c2.1.into(),
+                        end.0.into(),
+                        end.1.into(),
+                    ],
+                ),
+                Operation::new("S", vec![]),
+                Operation::new("Q", vec![]),
+            ]);
+        }
+    } else {
+        let pressures = resample_values(&curve.pressures, points.len());
+        let fracs = resample_values(&curve.fractional_widths, points.len());
+        for index in 0..points.len() - 1 {
+            let width = pen_width(
+                curve.width * doc_to_pt,
+                (pressures[index] + pressures[index + 1]) * 0.5,
+                (fracs[index] + fracs[index + 1]) * 0.5,
+            );
+            push_stroke_state(operations, curve, width, &gs);
+            operations.extend([
+                Operation::new("m", vec![points[index].0.into(), points[index].1.into()]),
+                Operation::new("l", vec![points[index + 1].0.into(), points[index + 1].1.into()]),
+                Operation::new("S", vec![]),
+                Operation::new("Q", vec![]),
+            ]);
+        }
+    }
 }
 
 fn draw_pencil_curve(
@@ -1071,6 +1195,21 @@ fn dash_lengths(pattern: u8, style: u8, width: f32) -> (f32, f32) {
         (2, false) => ((width * 0.12).max(0.12), (width * 1.6).max(0.9)),
         _ => ((width * 0.12).max(0.12), (width * 1.6).max(0.9)),
     }
+}
+
+fn curve_path_extent(curve: &StrokeCurve) -> f32 {
+    let Some((first_x, first_y)) = curve.points.first().copied() else {
+        return 0.0;
+    };
+    let (mut min_x, mut max_x) = (first_x, first_x);
+    let (mut min_y, mut max_y) = (first_y, first_y);
+    for (x, y) in &curve.points {
+        min_x = min_x.min(*x);
+        max_x = max_x.max(*x);
+        min_y = min_y.min(*y);
+        max_y = max_y.max(*y);
+    }
+    (max_x - min_x).hypot(max_y - min_y)
 }
 
 fn draw_path(operations: &mut Vec<Operation>, curve: &StrokeCurve, points: &[(f32, f32)]) {
@@ -1226,6 +1365,12 @@ fn pencil_width(base_width: f32, pressure: f32, frac: f32) -> f32 {
     let pressure = pressure.clamp(0.05, 2.5);
     let frac = frac.clamp(0.15, 3.0);
     (base_width * frac * (0.45 + 0.38 * pressure.sqrt())).max(0.1)
+}
+
+fn pen_width(base_width: f32, pressure: f32, frac: f32) -> f32 {
+    let pressure = pressure.clamp(0.2, 2.5);
+    let frac = frac.clamp(0.2, 3.0);
+    (base_width * frac * pressure.sqrt()).max(0.1)
 }
 
 fn resample_values(values: &[f32], target_count: usize) -> Vec<f32> {
@@ -1442,7 +1587,7 @@ fn draw_svg_text_content(
     let mut cursor_x_doc = 0.0f32;
     let mut cursor_y_doc = 0.0f32;
     let mut at_line_start = true;
-    let mut line_max_font_size = 0.0f32;
+    let mut line_height_doc = 0.0f32;
     let styles = build_style_map_for(text, text_spans);
     for (char_index, ch) in text.chars().enumerate() {
         if ch == '\r' {
@@ -1450,13 +1595,13 @@ fn draw_svg_text_content(
         }
         if ch == '\n' {
             cursor_x_doc = 0.0;
-            cursor_y_doc += text_line_advance_doc(line_spacing_doc, line_max_font_size);
-            line_max_font_size = 0.0;
+            cursor_y_doc += text_line_advance_doc(line_spacing_doc, line_height_doc);
+            line_height_doc = 0.0;
             at_line_start = true;
             continue;
         }
         let style = styles.get(char_index).cloned().unwrap_or_else(default_text_style);
-        line_max_font_size = line_max_font_size.max(style.font_size);
+        line_height_doc = line_height_doc.max(style.font_size * style.line_spacing_multiplier.max(1.0));
         if at_line_start {
             draw_svg_list_marker(
                 svg,
@@ -1475,8 +1620,8 @@ fn draw_svg_text_content(
         let char_width_doc = style.font_size * font_width_factor(&style, ch);
         if cursor_x_doc + char_width_doc > max_width_doc {
             cursor_x_doc = list_text_indent_doc(&style);
-            cursor_y_doc += text_line_advance_doc(line_spacing_doc, line_max_font_size);
-            line_max_font_size = style.font_size;
+            cursor_y_doc += text_line_advance_doc(line_spacing_doc, line_height_doc);
+            line_height_doc = style.font_size * style.line_spacing_multiplier.max(1.0);
         }
         let absolute_y_doc = origin_y_doc + cursor_y_doc;
         let char_page_index = (absolute_y_doc / note.page_height_doc).floor() as usize;
@@ -1530,6 +1675,9 @@ fn draw_svg_list_marker(
     let x = (content_inset_doc + origin_x_doc + list_marker_x_doc(style)) * doc_to_pt;
     let y = (cursor_y_doc - marker_page_index as f32 * note.page_height_doc) * doc_to_pt
         + style.font_size * doc_to_pt * 0.62;
+    let baseline_y =
+        (cursor_y_doc - marker_page_index as f32 * note.page_height_doc) * doc_to_pt
+            + style.font_size * doc_to_pt;
     let radius = if decoration_style == 3 {
         (style.font_size * doc_to_pt * 0.32).max(2.2)
     } else {
@@ -1543,7 +1691,7 @@ fn draw_svg_list_marker(
                 "font-weight=\"{}\" font-style=\"{}\" fill=\"{}\" xml:space=\"preserve\">{}</text>"
             ),
             x,
-            y + radius * 1.3,
+            baseline_y,
             svg_font_family(style),
             style.font_size * doc_to_pt,
             if style.bold { "bold" } else { "normal" },
@@ -1715,6 +1863,12 @@ fn draw_svg_pen_curve(
     page_height: f32,
 ) -> Result<()> {
     if curve.points.is_empty() {
+        return Ok(());
+    }
+    if curve.style == STROKE_STYLE_HIGHLIGHTER
+        && curve.dash_pattern.is_some()
+        && curve_path_extent(curve) < curve.width * 0.25
+    {
         return Ok(());
     }
     let points = stroke_points_svg(curve, doc_to_pt, content_inset_doc);

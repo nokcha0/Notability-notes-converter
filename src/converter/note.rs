@@ -176,6 +176,10 @@ fn parse_text(archive: &KeyedArchive, rich_text: &Dictionary) -> (String, Vec<Te
             .and_then(|value| archive.as_text(value).ok())
             .unwrap_or_else(|| "Helvetica".to_string());
         let other_attrs = archive.ns_dict(subrange.get("subRangeOtherAttributesKey"));
+        let line_spacing_multiplier = other_attrs
+            .get("line-spacing")
+            .and_then(value_f32)
+            .unwrap_or(1.0);
         let color = subrange
             .get("subRangeColorCrossPlatformKey")
             .or_else(|| subrange.get("subRangeColorKey"))
@@ -217,6 +221,7 @@ fn parse_text(archive: &KeyedArchive, rich_text: &Dictionary) -> (String, Vec<Te
             style: TextStyle {
                 font_size,
                 font_name,
+                line_spacing_multiplier,
                 color,
                 bold: lower_font_name.contains("bold"),
                 italic: lower_font_name.contains("italic") || lower_font_name.contains("oblique"),
@@ -237,6 +242,7 @@ fn parse_text(archive: &KeyedArchive, rich_text: &Dictionary) -> (String, Vec<Te
             style: TextStyle {
                 font_size: 12.0,
                 font_name: "Helvetica".to_string(),
+                line_spacing_multiplier: 1.0,
                 color: [0, 0, 0, 255],
                 bold: false,
                 italic: false,
@@ -511,7 +517,8 @@ fn parse_curves_from_spatial_hash(
             points.push(apply_transform(point, transform));
             points_index += 2;
         }
-        let width = widths.get(curve_index).copied().unwrap_or(1.0);
+        let width = widths.get(curve_index).copied().unwrap_or(1.0)
+            * transform_stroke_scale(transform);
         let style = styles.get(curve_index).copied().unwrap_or(3);
         let dash_pattern = dash_patterns.get(&curve_index).copied();
         let rgba =
@@ -850,6 +857,15 @@ fn apply_transform(point: (f32, f32), transform: Option<[f32; 6]>) -> (f32, f32)
         return point;
     };
     (a * point.0 + c * point.1 + tx, b * point.0 + d * point.1 + ty)
+}
+
+fn transform_stroke_scale(transform: Option<[f32; 6]>) -> f32 {
+    let Some([a, b, c, d, _, _]) = transform else {
+        return 1.0;
+    };
+    let x_scale = a.hypot(b);
+    let y_scale = c.hypot(d);
+    ((x_scale + y_scale) * 0.5).max(0.01)
 }
 
 fn default_if_empty(values: Vec<f32>, count: usize) -> Vec<f32> {
