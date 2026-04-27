@@ -2,6 +2,16 @@ use super::model::{DEFAULT_EXPORT_WIDTH_PT, NoteDocument};
 use plist::Value;
 
 pub(crate) fn parse_pair(value: &str) -> Option<(f32, f32)> {
+    let numbers = parse_numbers(value);
+    (numbers.len() >= 2).then(|| (numbers[0], numbers[1]))
+}
+
+pub(crate) fn parse_rect(value: &str) -> Option<(f32, f32, f32, f32)> {
+    let numbers = parse_numbers(value);
+    (numbers.len() >= 4).then(|| (numbers[0], numbers[1], numbers[2], numbers[3]))
+}
+
+fn parse_numbers(value: &str) -> Vec<f32> {
     let mut numbers = Vec::new();
     let mut current = String::new();
     for ch in value.chars() {
@@ -19,7 +29,7 @@ pub(crate) fn parse_pair(value: &str) -> Option<(f32, f32)> {
             numbers.push(number);
         }
     }
-    (numbers.len() >= 2).then(|| (numbers[0], numbers[1]))
+    numbers
 }
 
 pub(crate) fn value_f32(value: &Value) -> Option<f32> {
@@ -73,6 +83,9 @@ pub(crate) fn page_count_for(note: &NoteDocument) -> usize {
         page_count = page_count.max(max_page + 1);
     }
     if let Some(max_page) = note.media_images.iter().map(|media| media.page_index).max() {
+        page_count = page_count.max(max_page + 1);
+    }
+    if let Some(max_page) = note.text_blocks.iter().map(|block| block.page_index).max() {
         page_count = page_count.max(max_page + 1);
     }
     if let Some(max_page) = note.curves.iter().map(|curve| curve.page_index).max() {

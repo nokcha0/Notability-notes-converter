@@ -8,7 +8,8 @@ use super::util::{page_count_for, parse_line_spacing_doc};
 use crate::pdf::{add_form_xobject, page_box, page_id_by_index};
 use crate::Result;
 use flate2::{write::ZlibEncoder, Compression};
-use image::GenericImageView;
+use image::codecs::jpeg::JpegEncoder;
+use image::{DynamicImage, ExtendedColorType, GenericImageView, ImageFormat};
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use std::collections::{BTreeMap, BTreeSet};
@@ -56,11 +57,7 @@ fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) ->
     }
     output.max_id = max_id.saturating_sub(1);
 
-    let font_id = output.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "Type1",
-        "BaseFont" => "Helvetica",
-    });
+    let fonts = add_standard_fonts(&mut output);
     let pages_id = output.new_object_id();
     let page_count = page_count_for(note);
     let mut page_ids = Vec::with_capacity(page_count);
@@ -70,7 +67,7 @@ fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) ->
             &mut bundle,
             note,
             &loaded_pdfs,
-            font_id,
+            &fonts,
             pages_id,
             page_index,
         )?;
@@ -95,12 +92,70 @@ fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) ->
     Ok(())
 }
 
+struct PdfFonts {
+    helvetica: ObjectId,
+    helvetica_bold: ObjectId,
+    helvetica_oblique: ObjectId,
+    helvetica_bold_oblique: ObjectId,
+    courier: ObjectId,
+    courier_bold: ObjectId,
+    courier_oblique: ObjectId,
+    courier_bold_oblique: ObjectId,
+    times: ObjectId,
+    times_bold: ObjectId,
+    times_italic: ObjectId,
+    times_bold_italic: ObjectId,
+}
+
+impl PdfFonts {
+    fn resources(&self) -> [(&'static str, ObjectId); 12] {
+        [
+            ("FHelv", self.helvetica),
+            ("FHelvB", self.helvetica_bold),
+            ("FHelvI", self.helvetica_oblique),
+            ("FHelvBI", self.helvetica_bold_oblique),
+            ("FCour", self.courier),
+            ("FCourB", self.courier_bold),
+            ("FCourI", self.courier_oblique),
+            ("FCourBI", self.courier_bold_oblique),
+            ("FTimes", self.times),
+            ("FTimesB", self.times_bold),
+            ("FTimesI", self.times_italic),
+            ("FTimesBI", self.times_bold_italic),
+        ]
+    }
+}
+
+fn add_standard_fonts(output: &mut Document) -> PdfFonts {
+    fn add(output: &mut Document, base_font: &str) -> ObjectId {
+        output.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => base_font,
+        })
+    }
+    PdfFonts {
+        helvetica: add(output, "Helvetica"),
+        helvetica_bold: add(output, "Helvetica-Bold"),
+        helvetica_oblique: add(output, "Helvetica-Oblique"),
+        helvetica_bold_oblique: add(output, "Helvetica-BoldOblique"),
+        courier: add(output, "Courier"),
+        courier_bold: add(output, "Courier-Bold"),
+        courier_oblique: add(output, "Courier-Oblique"),
+        courier_bold_oblique: add(output, "Courier-BoldOblique"),
+        times: add(output, "Times-Roman"),
+        times_bold: add(output, "Times-Bold"),
+        times_italic: add(output, "Times-Italic"),
+        times_bold_italic: add(output, "Times-BoldItalic"),
+    }
+}
+
 fn write_page(
     output: &mut Document,
     bundle: &mut ZipArchive<File>,
     note: &NoteDocument,
     loaded_pdfs: &BTreeMap<String, Document>,
-    font_id: ObjectId,
+    fonts: &PdfFonts,
     pages_id: ObjectId,
     page_index: usize,
 ) -> Result<ObjectId> {
@@ -154,12 +209,20 @@ fn write_page(
         draw_text(
             &mut operations,
             note,
-            font_id,
+            page_index,
             doc_to_pt,
             content_inset_doc,
             line_spacing_doc,
         );
     }
+    draw_text_blocks(
+        &mut operations,
+        note,
+        page_index,
+        doc_to_pt,
+        content_inset_doc,
+        line_spacing_doc,
+    );
     for (image_index, media) in note
         .media_images
         .iter()
@@ -173,8 +236,36 @@ fn write_page(
         let y = media.y * doc_to_pt;
         let width = media.width * doc_to_pt;
         let height = media.height * doc_to_pt;
+        let draw_y = note.export_height_pt - y - height;
+        let center_x = x + width * 0.5;
+        let center_y = draw_y + height * 0.5;
+        let angle = -media.rotation_degrees.to_radians();
+        let cos = angle.cos();
+        let sin = angle.sin();
         operations.extend([
             Operation::new("q", vec![]),
+            Operation::new(
+                "cm",
+                vec![
+                    1.into(),
+                    0.into(),
+                    0.into(),
+                    1.into(),
+                    center_x.into(),
+                    center_y.into(),
+                ],
+            ),
+            Operation::new(
+                "cm",
+                vec![
+                    cos.into(),
+                    sin.into(),
+                    (-sin).into(),
+                    cos.into(),
+                    0.into(),
+                    0.into(),
+                ],
+            ),
             Operation::new(
                 "cm",
                 vec![
@@ -182,8 +273,8 @@ fn write_page(
                     0.into(),
                     0.into(),
                     height.into(),
-                    x.into(),
-                    (note.export_height_pt - y - height).into(),
+                    (-width * 0.5).into(),
+                    (-height * 0.5).into(),
                 ],
             ),
             Operation::new("Do", vec![name.into()]),
@@ -206,8 +297,12 @@ fn write_page(
         note.export_height_pt,
     );
 
+    let mut font_resources = Dictionary::new();
+    for (name, id) in fonts.resources() {
+        font_resources.set(name, id);
+    }
     let mut resources = dictionary! {
-        "Font" => dictionary! { "F1" => font_id },
+        "Font" => font_resources,
     };
     if !xobjects.is_empty() {
         resources.set("XObject", xobjects);
@@ -279,39 +374,114 @@ fn draw_background(
 fn draw_text(
     operations: &mut Vec<Operation>,
     note: &NoteDocument,
-    _font_id: ObjectId,
+    page_index: usize,
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+    line_spacing_doc: f32,
+) {
+    draw_text_content(
+        operations,
+        &note.text,
+        &note.text_spans,
+        page_index,
+        note.page_height_doc,
+        note.export_height_pt,
+        0.0,
+        DEFAULT_TEXT_TOP_DOC,
+        note.page_width_doc - content_inset_doc * 2.0,
+        doc_to_pt,
+        content_inset_doc,
+        line_spacing_doc,
+    );
+}
+
+fn draw_text_blocks(
+    operations: &mut Vec<Operation>,
+    note: &NoteDocument,
+    page_index: usize,
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+    line_spacing_doc: f32,
+) {
+    for block in note.text_blocks.iter().filter(|block| block.page_index == page_index) {
+        let _block_height_doc = block.height;
+        draw_text_content(
+            operations,
+            &block.text,
+            &block.text_spans,
+            page_index,
+            note.page_height_doc,
+            note.export_height_pt,
+            block.x,
+            block.y,
+            block.width,
+            doc_to_pt,
+            content_inset_doc,
+            line_spacing_doc,
+        );
+    }
+}
+
+fn draw_text_content(
+    operations: &mut Vec<Operation>,
+    text: &str,
+    text_spans: &[super::model::TextSpan],
+    target_page_index: usize,
+    page_height_doc: f32,
+    export_height_pt: f32,
+    origin_x_doc: f32,
+    origin_y_doc: f32,
+    max_width_doc: f32,
     doc_to_pt: f32,
     content_inset_doc: f32,
     line_spacing_doc: f32,
 ) {
     let mut cursor_x_doc = 0.0f32;
-    let mut cursor_y_doc = DEFAULT_TEXT_TOP_DOC;
-    let styles = build_style_map(note);
-    for (char_index, ch) in note.text.chars().enumerate() {
+    let mut cursor_y_doc = 0.0f32;
+    let mut at_line_start = true;
+    let mut line_max_font_size = 0.0f32;
+    let styles = build_style_map_for(text, text_spans);
+    for (char_index, ch) in text.chars().enumerate() {
         if ch == '\r' {
             continue;
         }
         if ch == '\n' {
             cursor_x_doc = 0.0;
-            cursor_y_doc += line_spacing_doc;
+            cursor_y_doc += text_line_advance_doc(line_spacing_doc, line_max_font_size);
+            line_max_font_size = 0.0;
+            at_line_start = true;
             continue;
         }
-        let style = styles.get(char_index).cloned().unwrap_or(TextStyle {
-            font_size: 12.0,
-            color: [0, 0, 0, 255],
-        });
-        let font_pt = style.font_size * doc_to_pt;
-        let char_width_doc = style.font_size * helvetica_width_factor(ch);
-        if content_inset_doc + cursor_x_doc + char_width_doc
-            > note.page_width_doc - content_inset_doc
-        {
-            cursor_x_doc = 0.0;
-            cursor_y_doc += line_spacing_doc;
+        let style = styles.get(char_index).cloned().unwrap_or_else(default_text_style);
+        line_max_font_size = line_max_font_size.max(style.font_size);
+        if at_line_start {
+            draw_pdf_list_marker(
+                operations,
+                &style,
+                origin_x_doc,
+                origin_y_doc + cursor_y_doc,
+                doc_to_pt,
+                content_inset_doc,
+                export_height_pt,
+            );
+            cursor_x_doc += list_text_indent_doc(&style);
+            at_line_start = false;
         }
-        let page_index = (cursor_y_doc / note.page_height_doc).floor() as usize;
-        if page_index == 0 {
-            let x = (content_inset_doc + cursor_x_doc) * doc_to_pt;
-            let y = note.export_height_pt - (cursor_y_doc * doc_to_pt + font_pt);
+        let font_pt = style.font_size * doc_to_pt;
+        let char_width_doc = style.font_size * font_width_factor(&style, ch);
+        if cursor_x_doc + char_width_doc > max_width_doc {
+            cursor_x_doc = list_text_indent_doc(&style);
+            cursor_y_doc += text_line_advance_doc(line_spacing_doc, line_max_font_size);
+            line_max_font_size = style.font_size;
+        }
+        let absolute_y_doc = origin_y_doc + cursor_y_doc;
+        let page_index = (absolute_y_doc / page_height_doc).floor() as usize;
+        if page_index == target_page_index {
+            let x = (content_inset_doc + origin_x_doc + cursor_x_doc) * doc_to_pt;
+            let baseline_offset_pt = style.baseline_offset * doc_to_pt;
+            let local_y_doc = absolute_y_doc - page_index as f32 * page_height_doc;
+            let y = export_height_pt - (local_y_doc * doc_to_pt + font_pt) + baseline_offset_pt;
+            let font_name = pdf_font_resource(&style);
             operations.extend([
                 Operation::new("BT", vec![]),
                 Operation::new(
@@ -322,25 +492,39 @@ fn draw_text(
                         (style.color[2] as f32 / 255.0).into(),
                     ],
                 ),
-                Operation::new("Tf", vec!["F1".into(), font_pt.into()]),
+                Operation::new("Tf", vec![font_name.into(), font_pt.into()]),
                 Operation::new("Td", vec![x.into(), y.into()]),
                 Operation::new("Tj", vec![Object::string_literal(ch.to_string())]),
                 Operation::new("ET", vec![]),
             ]);
+            if style.underline {
+                draw_text_rule(
+                    operations,
+                    &style,
+                    x,
+                    y - font_pt * 0.12,
+                    char_width_doc * doc_to_pt,
+                    font_pt,
+                );
+            }
+            if style.strikethrough || style.checklist_checked {
+                draw_text_rule(
+                    operations,
+                    &style,
+                    x,
+                    y + font_pt * 0.30,
+                    char_width_doc * doc_to_pt,
+                    font_pt,
+                );
+            }
         }
         cursor_x_doc += char_width_doc;
     }
 }
 
-fn build_style_map(note: &NoteDocument) -> Vec<TextStyle> {
-    let mut styles = vec![
-        TextStyle {
-            font_size: 12.0,
-            color: [0, 0, 0, 255],
-        };
-        note.text.chars().count()
-    ];
-    for span in &note.text_spans {
+fn build_style_map_for(text: &str, text_spans: &[super::model::TextSpan]) -> Vec<TextStyle> {
+    let mut styles = vec![default_text_style(); text.chars().count()];
+    for span in text_spans {
         for index in span.start..(span.start + span.length) {
             if let Some(slot) = styles.get_mut(index) {
                 *slot = span.style.clone();
@@ -348,6 +532,216 @@ fn build_style_map(note: &NoteDocument) -> Vec<TextStyle> {
         }
     }
     styles
+}
+
+fn default_text_style() -> TextStyle {
+    TextStyle {
+        font_size: 12.0,
+        font_name: "Helvetica".to_string(),
+        color: [0, 0, 0, 255],
+        bold: false,
+        italic: false,
+        underline: false,
+        strikethrough: false,
+        baseline_offset: 0.0,
+        indent_level: None,
+        indent_decoration_style: None,
+        indent_decoration_number: None,
+        checklist_checked: false,
+    }
+}
+
+fn text_line_advance_doc(line_spacing_doc: f32, max_font_size: f32) -> f32 {
+    line_spacing_doc.max(max_font_size * 1.18)
+}
+
+fn pdf_font_resource(style: &TextStyle) -> &'static str {
+    let lower = style.font_name.to_ascii_lowercase();
+    let family = if lower.contains("times") {
+        "times"
+    } else if lower.contains("typewriter") || lower.contains("courier") || lower.contains("mono") {
+        "courier"
+    } else {
+        "helvetica"
+    };
+    match (family, style.bold, style.italic) {
+        ("times", true, true) => "FTimesBI",
+        ("times", true, false) => "FTimesB",
+        ("times", false, true) => "FTimesI",
+        ("times", false, false) => "FTimes",
+        ("courier", true, true) => "FCourBI",
+        ("courier", true, false) => "FCourB",
+        ("courier", false, true) => "FCourI",
+        ("courier", false, false) => "FCour",
+        (_, true, true) => "FHelvBI",
+        (_, true, false) => "FHelvB",
+        (_, false, true) => "FHelvI",
+        (_, false, false) => "FHelv",
+    }
+}
+
+fn draw_text_rule(
+    operations: &mut Vec<Operation>,
+    style: &TextStyle,
+    x: f32,
+    y: f32,
+    width: f32,
+    font_pt: f32,
+) {
+    operations.extend([
+        Operation::new("q", vec![]),
+        Operation::new(
+            "RG",
+            vec![
+                (style.color[0] as f32 / 255.0).into(),
+                (style.color[1] as f32 / 255.0).into(),
+                (style.color[2] as f32 / 255.0).into(),
+            ],
+        ),
+        Operation::new("w", vec![(font_pt / 16.0).max(0.4).into()]),
+        Operation::new("m", vec![x.into(), y.into()]),
+        Operation::new("l", vec![(x + width).into(), y.into()]),
+        Operation::new("S", vec![]),
+        Operation::new("Q", vec![]),
+    ]);
+}
+
+fn draw_pdf_list_marker(
+    operations: &mut Vec<Operation>,
+    style: &TextStyle,
+    origin_x_doc: f32,
+    cursor_y_doc: f32,
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+    export_height_pt: f32,
+) {
+    let decoration_style = style.indent_decoration_style.unwrap_or(0);
+    if decoration_style == 0 {
+        return;
+    }
+    let level = style.indent_level.unwrap_or(0);
+    let x = (content_inset_doc + origin_x_doc + list_marker_x_doc(style)) * doc_to_pt;
+    let y = export_height_pt - (cursor_y_doc * doc_to_pt + style.font_size * doc_to_pt * 0.62);
+    let radius = if decoration_style == 3 {
+        (style.font_size * doc_to_pt * 0.32).max(2.2)
+    } else {
+        (style.font_size * doc_to_pt * 0.14).max(1.0)
+    };
+    if decoration_style == 2 {
+        let marker = list_number_marker(style);
+        operations.extend([
+            Operation::new("BT", vec![]),
+            Operation::new(
+                "rg",
+                vec![
+                    (style.color[0] as f32 / 255.0).into(),
+                    (style.color[1] as f32 / 255.0).into(),
+                    (style.color[2] as f32 / 255.0).into(),
+                ],
+            ),
+            Operation::new("Tf", vec![pdf_font_resource(style).into(), (style.font_size * doc_to_pt).into()]),
+            Operation::new("Td", vec![x.into(), (y - radius * 1.3).into()]),
+            Operation::new("Tj", vec![Object::string_literal(marker)]),
+            Operation::new("ET", vec![]),
+        ]);
+        return;
+    }
+    operations.extend([
+        Operation::new("q", vec![]),
+        Operation::new(
+            "RG",
+            vec![
+                (style.color[0] as f32 / 255.0).into(),
+                (style.color[1] as f32 / 255.0).into(),
+                (style.color[2] as f32 / 255.0).into(),
+            ],
+        ),
+        Operation::new(
+            "rg",
+            vec![
+                (style.color[0] as f32 / 255.0).into(),
+                (style.color[1] as f32 / 255.0).into(),
+                (style.color[2] as f32 / 255.0).into(),
+            ],
+        ),
+        Operation::new("w", vec![(radius * 0.35).max(0.5).into()]),
+    ]);
+    draw_circle(operations, (x, y), radius);
+    if decoration_style == 3 {
+        operations.push(Operation::new("S", vec![]));
+        if style.checklist_checked {
+            let r = radius * 0.85;
+            operations.extend([
+                Operation::new("m", vec![(x - r).into(), y.into()]),
+                Operation::new("l", vec![(x - r * 0.25).into(), (y - r * 0.65).into()]),
+                Operation::new("l", vec![(x + r).into(), (y + r * 0.75).into()]),
+                Operation::new("S", vec![]),
+            ]);
+        }
+    } else if style.checklist_checked {
+        operations.push(Operation::new("S", vec![]));
+        let r = radius * 0.85;
+        operations.extend([
+            Operation::new("m", vec![(x - r).into(), y.into()]),
+            Operation::new("l", vec![(x - r * 0.25).into(), (y - r * 0.65).into()]),
+            Operation::new("l", vec![(x + r).into(), (y + r * 0.75).into()]),
+            Operation::new("S", vec![]),
+        ]);
+    } else if level == 0 {
+        operations.push(Operation::new("f", vec![]));
+    } else {
+        operations.push(Operation::new("S", vec![]));
+    }
+    operations.push(Operation::new("Q", vec![]));
+}
+
+fn list_marker_x_doc(style: &TextStyle) -> f32 {
+    let level = style.indent_level.unwrap_or(0) as f32;
+    match style.indent_decoration_style.unwrap_or(0) {
+        2 => level * 25.0,
+        3 => level * 22.0,
+        _ => 1.5 + level * 22.0,
+    }
+}
+
+fn list_text_indent_doc(style: &TextStyle) -> f32 {
+    match style.indent_decoration_style.unwrap_or(0) {
+        0 => 0.0,
+        2 => list_marker_x_doc(style) + 47.0,
+        3 => list_marker_x_doc(style) + 22.0,
+        _ => list_marker_x_doc(style) + 11.0,
+    }
+}
+
+fn list_number_marker(style: &TextStyle) -> String {
+    let number = style.indent_decoration_number.unwrap_or(1).max(1);
+    match style.indent_level.unwrap_or(0) % 4 {
+        1 => format!("{}.", alpha_marker(number, true)),
+        2 => format!("{}.", alpha_marker(number, false)),
+        3 => format!("{number}."),
+        _ => format!("{number}."),
+    }
+}
+
+fn alpha_marker(number: i64, uppercase: bool) -> String {
+    let mut n = number.max(1);
+    let mut chars = Vec::new();
+    while n > 0 {
+        n -= 1;
+        let base = if uppercase { b'A' } else { b'a' };
+        chars.push((base + (n % 26) as u8) as char);
+        n /= 26;
+    }
+    chars.iter().rev().collect()
+}
+
+fn font_width_factor(style: &TextStyle, ch: char) -> f32 {
+    let lower = style.font_name.to_ascii_lowercase();
+    if lower.contains("typewriter") || lower.contains("courier") || lower.contains("mono") {
+        0.6
+    } else {
+        helvetica_width_factor(ch)
+    }
 }
 
 fn helvetica_width_factor(ch: char) -> f32 {
@@ -444,12 +838,22 @@ fn add_image_xobject(
 ) -> Result<ObjectId> {
     let path = note.bundle_root.clone() + &media.relative_path;
     let data = read_zip_entry(bundle, &path)?;
-    let image = image::load_from_memory(&data)?;
+    let image = load_media_image(&data, media)?;
     let (width, height) = image.dimensions();
     let rgb = image.to_rgb8();
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(rgb.as_raw())?;
-    let content = encoder.finish()?;
+    let mut content = Vec::new();
+    let is_jpeg = media.relative_path.to_ascii_lowercase().ends_with(".jpg")
+        || media.relative_path.to_ascii_lowercase().ends_with(".jpeg");
+    let filter = if is_jpeg {
+        let mut encoder = JpegEncoder::new_with_quality(&mut content, 88);
+        encoder.encode(rgb.as_raw(), width, height, ExtendedColorType::Rgb8)?;
+        "DCTDecode"
+    } else {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(rgb.as_raw())?;
+        content = encoder.finish()?;
+        "FlateDecode"
+    };
     Ok(output.add_object(Stream::new(
         dictionary! {
             "Type" => "XObject",
@@ -458,10 +862,28 @@ fn add_image_xobject(
             "Height" => height as i64,
             "ColorSpace" => "DeviceRGB",
             "BitsPerComponent" => 8,
-            "Filter" => "FlateDecode",
+            "Filter" => filter,
         },
         content,
     )))
+}
+
+fn load_media_image(data: &[u8], media: &super::model::MediaImage) -> Result<DynamicImage> {
+    let image = image::load_from_memory(data)?;
+    let Some(crop) = media.crop else {
+        return Ok(image);
+    };
+    let (image_width, image_height) = image.dimensions();
+    let x = crop.x.max(0.0).floor() as u32;
+    let y = crop.y.max(0.0).floor() as u32;
+    if x >= image_width || y >= image_height {
+        return Ok(image);
+    }
+    let width = crop.width.max(1.0).ceil() as u32;
+    let height = crop.height.max(1.0).ceil() as u32;
+    let width = width.min(image_width - x);
+    let height = height.min(image_height - y);
+    Ok(image.crop_imm(x, y, width, height))
 }
 
 fn draw_curves(
@@ -539,7 +961,7 @@ fn draw_pen_curve(
         draw_circle(operations, points[0], radius);
         operations.push(Operation::new("f", vec![]));
     } else {
-        draw_path(operations, &points);
+        draw_path(operations, curve, &points);
         operations.push(Operation::new("S", vec![]));
     }
     operations.push(Operation::new("Q", vec![]));
@@ -634,11 +1056,30 @@ fn push_stroke_state(
         Operation::new("J", vec![1.into()]),
         Operation::new("j", vec![1.into()]),
     ]);
+    if let Some(pattern) = curve.dash_pattern {
+        let (on, off) = dash_lengths(pattern, curve.style, width);
+        let dash = vec![on.into(), off.into()];
+        operations.push(Operation::new("d", vec![Object::Array(dash), 0.into()]));
+    }
 }
 
-fn draw_path(operations: &mut Vec<Operation>, points: &[(f32, f32)]) {
+fn dash_lengths(pattern: u8, style: u8, width: f32) -> (f32, f32) {
+    match (pattern, style == STROKE_STYLE_HIGHLIGHTER) {
+        (1, true) => ((width * 2.0).max(2.0), (width * 1.4).max(1.4)),
+        (2, true) => ((width * 0.12).max(0.12), (width * 1.8).max(1.8)),
+        (1, false) => ((width * 0.12).max(0.12), (width * 2.1).max(1.2)),
+        (2, false) => ((width * 0.12).max(0.12), (width * 1.6).max(0.9)),
+        _ => ((width * 0.12).max(0.12), (width * 1.6).max(0.9)),
+    }
+}
+
+fn draw_path(operations: &mut Vec<Operation>, curve: &StrokeCurve, points: &[(f32, f32)]) {
     operations.push(Operation::new("m", vec![points[0].0.into(), points[0].1.into()]));
-    if is_bezier_point_count(points.len()) {
+    if curve.preserve_vertices || points.len() == 2 {
+        for point in points.iter().skip(1) {
+            operations.push(Operation::new("l", vec![point.0.into(), point.1.into()]));
+        }
+    } else if is_bezier_point_count(points.len()) {
         for segment_index in 0..((points.len() - 1) / 3) {
             let c1 = points[segment_index * 3 + 1];
             let c2 = points[segment_index * 3 + 2];
@@ -655,8 +1096,6 @@ fn draw_path(operations: &mut Vec<Operation>, points: &[(f32, f32)]) {
                 ],
             ));
         }
-    } else if points.len() == 2 {
-        operations.push(Operation::new("l", vec![points[1].0.into(), points[1].1.into()]));
     } else {
         for (c1, c2, end) in smoothed_cubic_segments(points) {
             operations.push(Operation::new(
@@ -834,7 +1273,6 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
     let content_inset_doc = note.page_width_doc * DEFAULT_CONTENT_INSET_RATIO;
     let line_spacing_doc =
         parse_line_spacing_doc(note.line_style.as_deref(), note.page_width_doc, note.export_width_pt);
-    let styles = build_style_map(note);
     let mut svg = String::new();
     write!(
         svg,
@@ -871,7 +1309,14 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
             &mut svg,
             note,
             page_index,
-            &styles,
+            doc_to_pt,
+            content_inset_doc,
+            line_spacing_doc,
+        )?;
+        draw_svg_text_blocks(
+            &mut svg,
+            note,
+            page_index,
             doc_to_pt,
             content_inset_doc,
             line_spacing_doc,
@@ -935,53 +1380,241 @@ fn draw_svg_text(
     svg: &mut String,
     note: &NoteDocument,
     page_index: usize,
-    styles: &[TextStyle],
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+    line_spacing_doc: f32,
+) -> Result<()> {
+    draw_svg_text_content(
+        svg,
+        note,
+        page_index,
+        &note.text,
+        &note.text_spans,
+        0.0,
+        DEFAULT_TEXT_TOP_DOC,
+        note.page_width_doc - content_inset_doc * 2.0,
+        doc_to_pt,
+        content_inset_doc,
+        line_spacing_doc,
+    )
+}
+
+fn draw_svg_text_blocks(
+    svg: &mut String,
+    note: &NoteDocument,
+    page_index: usize,
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+    line_spacing_doc: f32,
+) -> Result<()> {
+    for block in note.text_blocks.iter().filter(|block| block.page_index == page_index) {
+        let _block_height_doc = block.height;
+        draw_svg_text_content(
+            svg,
+            note,
+            page_index,
+            &block.text,
+            &block.text_spans,
+            block.x,
+            block.y,
+            block.width,
+            doc_to_pt,
+            content_inset_doc,
+            line_spacing_doc,
+        )?;
+    }
+    Ok(())
+}
+
+fn draw_svg_text_content(
+    svg: &mut String,
+    note: &NoteDocument,
+    page_index: usize,
+    text: &str,
+    text_spans: &[super::model::TextSpan],
+    origin_x_doc: f32,
+    origin_y_doc: f32,
+    max_width_doc: f32,
     doc_to_pt: f32,
     content_inset_doc: f32,
     line_spacing_doc: f32,
 ) -> Result<()> {
     let mut cursor_x_doc = 0.0f32;
-    let mut cursor_y_doc = DEFAULT_TEXT_TOP_DOC;
-    for (char_index, ch) in note.text.chars().enumerate() {
+    let mut cursor_y_doc = 0.0f32;
+    let mut at_line_start = true;
+    let mut line_max_font_size = 0.0f32;
+    let styles = build_style_map_for(text, text_spans);
+    for (char_index, ch) in text.chars().enumerate() {
         if ch == '\r' {
             continue;
         }
         if ch == '\n' {
             cursor_x_doc = 0.0;
-            cursor_y_doc += line_spacing_doc;
+            cursor_y_doc += text_line_advance_doc(line_spacing_doc, line_max_font_size);
+            line_max_font_size = 0.0;
+            at_line_start = true;
             continue;
         }
-        let style = styles.get(char_index).cloned().unwrap_or(TextStyle {
-            font_size: 12.0,
-            color: [0, 0, 0, 255],
-        });
-        let font_pt = style.font_size * doc_to_pt;
-        let char_width_doc = style.font_size * helvetica_width_factor(ch);
-        if content_inset_doc + cursor_x_doc + char_width_doc
-            > note.page_width_doc - content_inset_doc
-        {
-            cursor_x_doc = 0.0;
-            cursor_y_doc += line_spacing_doc;
+        let style = styles.get(char_index).cloned().unwrap_or_else(default_text_style);
+        line_max_font_size = line_max_font_size.max(style.font_size);
+        if at_line_start {
+            draw_svg_list_marker(
+                svg,
+                note,
+                page_index,
+                &style,
+                origin_x_doc,
+                origin_y_doc + cursor_y_doc,
+                doc_to_pt,
+                content_inset_doc,
+            )?;
+            cursor_x_doc += list_text_indent_doc(&style);
+            at_line_start = false;
         }
-        let char_page_index = (cursor_y_doc / note.page_height_doc).floor() as usize;
+        let font_pt = style.font_size * doc_to_pt;
+        let char_width_doc = style.font_size * font_width_factor(&style, ch);
+        if cursor_x_doc + char_width_doc > max_width_doc {
+            cursor_x_doc = list_text_indent_doc(&style);
+            cursor_y_doc += text_line_advance_doc(line_spacing_doc, line_max_font_size);
+            line_max_font_size = style.font_size;
+        }
+        let absolute_y_doc = origin_y_doc + cursor_y_doc;
+        let char_page_index = (absolute_y_doc / note.page_height_doc).floor() as usize;
         if char_page_index == page_index {
-            let x = (content_inset_doc + cursor_x_doc) * doc_to_pt;
-            let y = cursor_y_doc * doc_to_pt + font_pt;
+            let x = (content_inset_doc + origin_x_doc + cursor_x_doc) * doc_to_pt;
+            let local_y_doc = absolute_y_doc - char_page_index as f32 * note.page_height_doc;
+            let y = local_y_doc * doc_to_pt + font_pt - style.baseline_offset * doc_to_pt;
             write!(
                 svg,
                 concat!(
-                    "<text x=\"{:.2}\" y=\"{:.2}\" font-family=\"Helvetica\" font-size=\"{:.2}\" ",
+                    "<text x=\"{:.2}\" y=\"{:.2}\" font-family=\"{}\" font-size=\"{:.2}\" ",
+                    "font-weight=\"{}\" font-style=\"{}\" text-decoration=\"{}\" ",
                     "fill=\"{}\" fill-opacity=\"{:.3}\" xml:space=\"preserve\">{}</text>"
                 ),
                 x,
                 y,
+                svg_font_family(&style),
                 font_pt,
+                if style.bold { "bold" } else { "normal" },
+                if style.italic { "italic" } else { "normal" },
+                svg_text_decoration(&style),
                 svg_rgb(style.color),
                 style.color[3] as f32 / 255.0,
                 escape_xml_text_char(ch)
             )?;
         }
         cursor_x_doc += char_width_doc;
+    }
+    Ok(())
+}
+
+fn draw_svg_list_marker(
+    svg: &mut String,
+    note: &NoteDocument,
+    page_index: usize,
+    style: &TextStyle,
+    origin_x_doc: f32,
+    cursor_y_doc: f32,
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+) -> Result<()> {
+    let decoration_style = style.indent_decoration_style.unwrap_or(0);
+    if decoration_style == 0 {
+        return Ok(());
+    }
+    let marker_page_index = (cursor_y_doc / note.page_height_doc).floor() as usize;
+    if marker_page_index != page_index {
+        return Ok(());
+    }
+    let level = style.indent_level.unwrap_or(0);
+    let x = (content_inset_doc + origin_x_doc + list_marker_x_doc(style)) * doc_to_pt;
+    let y = (cursor_y_doc - marker_page_index as f32 * note.page_height_doc) * doc_to_pt
+        + style.font_size * doc_to_pt * 0.62;
+    let radius = if decoration_style == 3 {
+        (style.font_size * doc_to_pt * 0.32).max(2.2)
+    } else {
+        (style.font_size * doc_to_pt * 0.14).max(1.0)
+    };
+    if decoration_style == 2 {
+        write!(
+            svg,
+            concat!(
+                "<text x=\"{:.2}\" y=\"{:.2}\" font-family=\"{}\" font-size=\"{:.2}\" ",
+                "font-weight=\"{}\" font-style=\"{}\" fill=\"{}\" xml:space=\"preserve\">{}</text>"
+            ),
+            x,
+            y + radius * 1.3,
+            svg_font_family(style),
+            style.font_size * doc_to_pt,
+            if style.bold { "bold" } else { "normal" },
+            if style.italic { "italic" } else { "normal" },
+            svg_rgb(style.color),
+            escape_xml_text(&list_number_marker(style))
+        )?;
+    } else if decoration_style == 3 {
+        write!(
+            svg,
+            "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.2}\"/>",
+            x,
+            y,
+            radius,
+            svg_rgb(style.color),
+            (radius * 0.35).max(0.5)
+        )?;
+        if style.checklist_checked {
+            write!(
+                svg,
+                "<path d=\"M {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.2}\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+                x - radius * 0.85,
+                y,
+                x - radius * 0.20,
+                y + radius * 0.60,
+                x + radius * 0.90,
+                y - radius * 0.75,
+                svg_rgb(style.color),
+                (radius * 0.35).max(0.5)
+            )?;
+        }
+    } else if style.checklist_checked {
+        write!(
+            svg,
+            concat!(
+                "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.2}\"/>",
+                "<path d=\"M {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.2}\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>"
+            ),
+            x,
+            y,
+            radius,
+            svg_rgb(style.color),
+            (radius * 0.35).max(0.5),
+            x - radius * 0.85,
+            y,
+            x - radius * 0.20,
+            y + radius * 0.60,
+            x + radius * 0.90,
+            y - radius * 0.75,
+            svg_rgb(style.color),
+            (radius * 0.35).max(0.5)
+        )?;
+    } else if level == 0 {
+        write!(
+            svg,
+            "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\" fill=\"{}\"/>",
+            x,
+            y,
+            radius,
+            svg_rgb(style.color)
+        )?;
+    } else {
+        write!(
+            svg,
+            "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.2}\"/>",
+            x,
+            y,
+            radius,
+            svg_rgb(style.color),
+            (radius * 0.35).max(0.5)
+        )?;
     }
     Ok(())
 }
@@ -1001,18 +1634,41 @@ fn draw_svg_images(
     {
         let path = note.bundle_root.clone() + &media.relative_path;
         let data = read_zip_entry(bundle, &path)?;
+        let (mime_type, encoded_data) = if media.crop.is_some() {
+            let image = load_media_image(&data, media)?;
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut cursor, ImageFormat::Png)?;
+            ("image/png", cursor.into_inner())
+        } else {
+            (media_mime_type(&media.relative_path), data)
+        };
+        let x = (content_inset_doc + media.x) * doc_to_pt;
+        let y = media.y * doc_to_pt;
+        let width = media.width * doc_to_pt;
+        let height = media.height * doc_to_pt;
+        let transform = if media.rotation_degrees.abs() > f32::EPSILON {
+            format!(
+                " transform=\"rotate({:.4} {:.2} {:.2})\"",
+                media.rotation_degrees,
+                x + width * 0.5,
+                y + height * 0.5
+            )
+        } else {
+            String::new()
+        };
         write!(
             svg,
             concat!(
                 "<image x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" ",
-                "href=\"data:{};base64,{}\" preserveAspectRatio=\"none\"/>"
+                "href=\"data:{};base64,{}\" preserveAspectRatio=\"none\"{}/>"
             ),
-            (content_inset_doc + media.x) * doc_to_pt,
-            media.y * doc_to_pt,
-            media.width * doc_to_pt,
-            media.height * doc_to_pt,
-            media_mime_type(&media.relative_path),
-            base64_encode(&data)
+            x,
+            y,
+            width,
+            height,
+            mime_type,
+            base64_encode(&encoded_data),
+            transform
         )?;
     }
     Ok(())
@@ -1083,12 +1739,13 @@ fn draw_svg_pen_curve(
             svg,
             concat!(
                 "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-opacity=\"{:.3}\" ",
-                "stroke-width=\"{:.2}\" stroke-linecap=\"round\" stroke-linejoin=\"round\"{} />"
+                "stroke-width=\"{:.2}\" stroke-linecap=\"round\" stroke-linejoin=\"round\"{}{} />"
             ),
-            svg_path_data(&points),
+            svg_path_data(curve, &points),
             svg_rgb(curve.rgba),
             alpha,
             (curve.width * doc_to_pt).max(0.1),
+            svg_dash_attr(curve, doc_to_pt),
             svg_blend_attr(multiply)
         )?;
     }
@@ -1179,10 +1836,14 @@ fn stroke_points_svg(
         .collect()
 }
 
-fn svg_path_data(points: &[(f32, f32)]) -> String {
+fn svg_path_data(curve: &StrokeCurve, points: &[(f32, f32)]) -> String {
     let mut data = String::new();
     let _ = write!(data, "M {:.2} {:.2}", points[0].0, points[0].1);
-    if is_bezier_point_count(points.len()) {
+    if curve.preserve_vertices || points.len() == 2 {
+        for point in points.iter().skip(1) {
+            let _ = write!(data, " L {:.2} {:.2}", point.0, point.1);
+        }
+    } else if is_bezier_point_count(points.len()) {
         for segment_index in 0..((points.len() - 1) / 3) {
             let c1 = points[segment_index * 3 + 1];
             let c2 = points[segment_index * 3 + 2];
@@ -1193,8 +1854,6 @@ fn svg_path_data(points: &[(f32, f32)]) -> String {
                 c1.0, c1.1, c2.0, c2.1, end.0, end.1
             );
         }
-    } else if points.len() == 2 {
-        let _ = write!(data, " L {:.2} {:.2}", points[1].0, points[1].1);
     } else {
         for (c1, c2, end) in smoothed_cubic_segments(points) {
             let _ = write!(
@@ -1219,6 +1878,35 @@ fn svg_blend_attr(multiply: bool) -> &'static str {
     }
 }
 
+fn svg_dash_attr(curve: &StrokeCurve, doc_to_pt: f32) -> String {
+    let Some(pattern) = curve.dash_pattern else {
+        return String::new();
+    };
+    let width = (curve.width * doc_to_pt).max(0.1);
+    let (on, off) = dash_lengths(pattern, curve.style, width);
+    format!(" stroke-dasharray=\"{on:.2} {off:.2}\"")
+}
+
+fn svg_font_family(style: &TextStyle) -> &'static str {
+    let lower = style.font_name.to_ascii_lowercase();
+    if lower.contains("times") {
+        "Times New Roman, Times, serif"
+    } else if lower.contains("typewriter") || lower.contains("courier") || lower.contains("mono") {
+        "Courier, monospace"
+    } else {
+        "Helvetica, Arial, sans-serif"
+    }
+}
+
+fn svg_text_decoration(style: &TextStyle) -> &'static str {
+    match (style.underline, style.strikethrough || style.checklist_checked) {
+        (true, true) => "underline line-through",
+        (true, false) => "underline",
+        (false, true) => "line-through",
+        (false, false) => "none",
+    }
+}
+
 fn media_mime_type(path: &str) -> &'static str {
     if path.to_ascii_lowercase().ends_with(".png") {
         "image/png"
@@ -1236,6 +1924,10 @@ fn escape_xml_text_char(ch: char) -> String {
         '\'' => "&apos;".to_owned(),
         _ => ch.to_string(),
     }
+}
+
+fn escape_xml_text(text: &str) -> String {
+    text.chars().map(escape_xml_text_char).collect()
 }
 
 fn base64_encode(data: &[u8]) -> String {

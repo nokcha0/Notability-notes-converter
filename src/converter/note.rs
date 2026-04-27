@@ -1,14 +1,15 @@
 use super::archive::KeyedArchive;
 use super::model::{
-    EmbeddedPdfPage, MediaImage, NoteDocument, StrokeCurve, TextSpan, TextStyle,
+    EmbeddedPdfPage, ImageCrop, MediaImage, NoteDocument, StrokeCurve, TextBlock, TextSpan, TextStyle,
     DEFAULT_PAGE_RATIO,
 };
-use super::util::{choose_export_width, parse_pair, value_f32, value_i64};
+use super::util::{choose_export_width, parse_pair, parse_rect, value_f32, value_i64};
 use crate::pdf::{page_box, page_id_by_index};
 use crate::Result;
 use image::GenericImageView;
 use lopdf::Document;
 use plist::{Dictionary, Value};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::Path;
@@ -62,6 +63,7 @@ pub(crate) fn load_note_document(note_path: &Path) -> Result<NoteDocument> {
     let page_height_doc = page_width_doc * page_ratio;
 
     let (text, text_spans) = parse_text(&archive, rich_text);
+    let text_blocks = parse_text_blocks(&archive, rich_text, page_height_doc);
     let media_images = parse_media_images(&archive, rich_text, page_height_doc);
     let curves = parse_curves(&archive, rich_text, page_height_doc);
     Ok(NoteDocument {
@@ -73,6 +75,7 @@ pub(crate) fn load_note_document(note_path: &Path) -> Result<NoteDocument> {
         line_style,
         text,
         text_spans,
+        text_blocks,
         media_images,
         pdf_pages,
         curves,
@@ -168,15 +171,63 @@ fn parse_text(archive: &KeyedArchive, rich_text: &Dictionary) -> (String, Vec<Te
             .get("NSFontSizeAttribute")
             .and_then(value_f32)
             .unwrap_or(12.0);
+        let font_name = font_attrs
+            .get("NSFontNameAttribute")
+            .and_then(|value| archive.as_text(value).ok())
+            .unwrap_or_else(|| "Helvetica".to_string());
+        let other_attrs = archive.ns_dict(subrange.get("subRangeOtherAttributesKey"));
         let color = subrange
             .get("subRangeColorCrossPlatformKey")
             .or_else(|| subrange.get("subRangeColorKey"))
             .map(|value| parse_text_color(archive.deref(value)))
             .unwrap_or([0, 0, 0, 255]);
+        let underline = other_attrs
+            .get("NSUnderline")
+            .and_then(value_i64)
+            .unwrap_or(0)
+            != 0;
+        let strikethrough = other_attrs
+            .get("NSStrikethrough")
+            .and_then(value_i64)
+            .unwrap_or(0)
+            != 0;
+        let baseline_offset = other_attrs
+            .get("NSBaselineOffset")
+            .and_then(value_f32)
+            .unwrap_or(0.0);
+        let indent_level = other_attrs
+            .get("indent-level")
+            .and_then(value_i64)
+            .map(|level| level.max(0) as usize);
+        let indent_decoration_style = other_attrs
+            .get("indent-decoration-style")
+            .and_then(value_i64);
+        let indent_decoration_number = other_attrs
+            .get("indent-decoration-number")
+            .and_then(value_i64);
+        let checklist_checked = other_attrs
+            .get("checklist-checked")
+            .and_then(value_i64)
+            .unwrap_or(0)
+            != 0;
+        let lower_font_name = font_name.to_ascii_lowercase();
         spans.push(TextSpan {
             start: start as usize,
             length: length as usize,
-            style: TextStyle { font_size, color },
+            style: TextStyle {
+                font_size,
+                font_name,
+                color,
+                bold: lower_font_name.contains("bold"),
+                italic: lower_font_name.contains("italic") || lower_font_name.contains("oblique"),
+                underline,
+                strikethrough,
+                baseline_offset,
+                indent_level,
+                indent_decoration_style,
+                indent_decoration_number,
+                checklist_checked,
+            },
         });
     }
     if spans.is_empty() {
@@ -185,7 +236,17 @@ fn parse_text(archive: &KeyedArchive, rich_text: &Dictionary) -> (String, Vec<Te
             length: text.chars().count(),
             style: TextStyle {
                 font_size: 12.0,
+                font_name: "Helvetica".to_string(),
                 color: [0, 0, 0, 255],
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                baseline_offset: 0.0,
+                indent_level: None,
+                indent_decoration_style: None,
+                indent_decoration_number: None,
+                checklist_checked: false,
             },
         });
     }
@@ -223,6 +284,64 @@ fn unit_to_u8(value: f32) -> u8 {
     (value * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
+fn parse_text_blocks(
+    archive: &KeyedArchive,
+    rich_text: &Dictionary,
+    page_height_doc: f32,
+) -> Vec<TextBlock> {
+    let mut blocks = Vec::new();
+    for raw_media in archive.ns_array(rich_text.get("mediaObjects")) {
+        let Some(media) = raw_media.as_dictionary() else {
+            continue;
+        };
+        let class_name = media
+            .get("$class")
+            .map(|value| archive.deref(value))
+            .and_then(Value::as_dictionary)
+            .and_then(|class| class.get("$classname"))
+            .and_then(Value::as_string)
+            .unwrap_or("");
+        if class_name != "TextBlockMediaObject" {
+            continue;
+        }
+        let Some((x, y)) = media
+            .get("documentOrigin")
+            .and_then(|value| archive.as_text(value).ok())
+            .and_then(|text| parse_pair(&text))
+        else {
+            continue;
+        };
+        let Some((width, height)) = media
+            .get("unscaledContentSize")
+            .and_then(|value| archive.as_text(value).ok())
+            .and_then(|text| parse_pair(&text))
+        else {
+            continue;
+        };
+        let Some(text_store) = media
+            .get("textStore")
+            .map(|value| archive.deref(value))
+            .and_then(Value::as_dictionary)
+        else {
+            continue;
+        };
+        let (text, text_spans) = parse_text(archive, text_store);
+        let page_index = (y / page_height_doc).floor() as usize;
+        blocks.push(TextBlock {
+            page_index,
+            x,
+            y: y - page_index as f32 * page_height_doc,
+            width,
+            height,
+            text,
+            text_spans,
+            z_index: media.get("zIndex").and_then(value_i64).unwrap_or(0),
+        });
+    }
+    blocks.sort_by_key(|block| (block.page_index, block.z_index));
+    blocks
+}
+
 fn parse_media_images(
     archive: &KeyedArchive,
     rich_text: &Dictionary,
@@ -247,10 +366,11 @@ fn parse_media_images(
         else {
             continue;
         };
-        let relative_path = media
+        let figure = media
             .get("figure")
             .map(|value| archive.deref(value))
-            .and_then(Value::as_dictionary)
+            .and_then(Value::as_dictionary);
+        let relative_path = figure
             .and_then(|figure| figure.get("FigureBackgroundObjectKey"))
             .map(|value| archive.deref(value))
             .and_then(Value::as_dictionary)
@@ -262,6 +382,18 @@ fn parse_media_images(
         let Some(relative_path) = relative_path else {
             continue;
         };
+        let crop = figure
+            .and_then(|figure| figure.get("FigureCropRectKey"))
+            .and_then(|value| archive.as_text(value).ok())
+            .and_then(|text| parse_rect(&text))
+            .and_then(|(x, y, width, height)| {
+                (width > 0.0 && height > 0.0).then_some(ImageCrop {
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+            });
         let page_index = (y / page_height_doc).floor() as usize;
         images.push(MediaImage {
             page_index,
@@ -269,12 +401,26 @@ fn parse_media_images(
             y: y - page_index as f32 * page_height_doc,
             width,
             height,
+            rotation_degrees: media
+                .get("rotationDegrees")
+                .and_then(value_f32)
+                .map(normalize_rotation_degrees)
+                .unwrap_or(0.0),
             relative_path,
             z_index: media.get("zIndex").and_then(value_i64).unwrap_or(0),
+            crop,
         });
     }
     images.sort_by_key(|image| (image.page_index, image.z_index));
     images
+}
+
+fn normalize_rotation_degrees(raw: f32) -> f32 {
+    if raw.abs() <= std::f32::consts::TAU + 0.001 {
+        raw.to_degrees()
+    } else {
+        raw
+    }
 }
 
 fn parse_pdf_pages(archive: &KeyedArchive, rich_text: &Dictionary) -> Vec<EmbeddedPdfPage> {
@@ -324,19 +470,27 @@ fn parse_curves(
     else {
         return Vec::new();
     };
-    let counts = unpack_i32(spatial_hash.get("curvesnumpoints"));
-    let widths = unpack_f32(spatial_hash.get("curveswidth"));
-    let points_blob = unpack_f32(spatial_hash.get("curvespoints"));
-    let pressures_blob = unpack_f32(spatial_hash.get("curvesforces"));
-    let fractional_widths_blob = unpack_f32(spatial_hash.get("curvesfractionalwidths"));
-    let styles = spatial_hash
-        .get("curvesstyles")
-        .and_then(Value::as_data)
-        .unwrap_or(&[]);
-    let colors = spatial_hash
-        .get("curvescolors")
-        .and_then(Value::as_data)
-        .unwrap_or(&[]);
+    let mut curves =
+        parse_curves_from_spatial_hash(Some(archive), spatial_hash, page_height_doc, None);
+    curves.extend(parse_group_curves(archive, spatial_hash, page_height_doc));
+    curves.extend(parse_shape_curves(archive, spatial_hash, page_height_doc));
+    curves
+}
+
+fn parse_curves_from_spatial_hash(
+    archive: Option<&KeyedArchive>,
+    spatial_hash: &Dictionary,
+    page_height_doc: f32,
+    transform: Option<[f32; 6]>,
+) -> Vec<StrokeCurve> {
+    let counts = unpack_i32(archive, spatial_hash.get("curvesnumpoints"));
+    let widths = unpack_f32(archive, spatial_hash.get("curveswidth"));
+    let points_blob = unpack_f32(archive, spatial_hash.get("curvespoints"));
+    let pressures_blob = unpack_f32(archive, spatial_hash.get("curvesforces"));
+    let fractional_widths_blob = unpack_f32(archive, spatial_hash.get("curvesfractionalwidths"));
+    let styles = value_data(archive, spatial_hash.get("curvesstyles")).unwrap_or(&[]);
+    let dash_patterns = parse_dash_patterns(archive, spatial_hash.get("dashStyles"));
+    let colors = value_data(archive, spatial_hash.get("curvescolors")).unwrap_or(&[]);
     let sample_counts: Vec<usize> = counts
         .iter()
         .map(|count| bezier_sample_count(*count as usize))
@@ -353,11 +507,13 @@ fn parse_curves(
             if points_index + 1 >= points_blob.len() {
                 break;
             }
-            points.push((points_blob[points_index], points_blob[points_index + 1]));
+            let point = (points_blob[points_index], points_blob[points_index + 1]);
+            points.push(apply_transform(point, transform));
             points_index += 2;
         }
         let width = widths.get(curve_index).copied().unwrap_or(1.0);
         let style = styles.get(curve_index).copied().unwrap_or(3);
+        let dash_pattern = dash_patterns.get(&curve_index).copied();
         let rgba =
             parse_handwriting_color(colors.get(curve_index * 4..curve_index * 4 + 4).unwrap_or(&[]));
         let (pressures, fractional_widths) = if use_bezier_samples {
@@ -381,15 +537,319 @@ fn parse_curves(
         };
         curves.extend(split_curve_into_pages(
             points,
+            false,
             width,
             rgba,
             style,
+            dash_pattern,
             pressures,
             fractional_widths,
             page_height_doc,
         ));
     }
     curves
+}
+
+fn parse_group_curves(
+    archive: &KeyedArchive,
+    spatial_hash: &Dictionary,
+    page_height_doc: f32,
+) -> Vec<StrokeCurve> {
+    let mut curves = Vec::new();
+    for raw_group in archive.ns_array(spatial_hash.get("groupsArrays")) {
+        let Some(group_bytes) = raw_group.as_data() else {
+            continue;
+        };
+        let Ok(group_value) = Value::from_reader(Cursor::new(group_bytes)) else {
+            continue;
+        };
+        let Some(group) = group_value.as_dictionary() else {
+            continue;
+        };
+        let Some(ink_group) = group.get("inkGroup").and_then(Value::as_dictionary) else {
+            continue;
+        };
+        let transform = ink_group.get("transform").and_then(parse_transform);
+        let Some(objects) = ink_group.get("inkGroupObjects").and_then(Value::as_array) else {
+            continue;
+        };
+        for object in objects {
+            let Some(object_bytes) = object
+                .as_dictionary()
+                .and_then(|entry| entry.get("object"))
+                .and_then(Value::as_data)
+            else {
+                continue;
+            };
+            let Ok(nested_value) = Value::from_reader(Cursor::new(object_bytes)) else {
+                continue;
+            };
+            let Ok(nested_archive) = KeyedArchive::new(nested_value) else {
+                continue;
+            };
+            let Some(nested_spatial_hash) = nested_archive.root.as_dictionary() else {
+                continue;
+            };
+            curves.extend(parse_curves_from_spatial_hash(
+                Some(&nested_archive),
+                nested_spatial_hash,
+                page_height_doc,
+                transform,
+            ));
+        }
+    }
+    curves
+}
+
+fn parse_dash_patterns(
+    archive: Option<&KeyedArchive>,
+    value: Option<&Value>,
+) -> BTreeMap<usize, u8> {
+    let Some(data) = value_data(archive, value) else {
+        return BTreeMap::new();
+    };
+    let Ok(value) = Value::from_reader(Cursor::new(data)) else {
+        return BTreeMap::new();
+    };
+    let Some(patterns) = value
+        .as_dictionary()
+        .and_then(|root| root.get("objectPatterns"))
+        .and_then(Value::as_dictionary)
+    else {
+        return BTreeMap::new();
+    };
+    patterns
+        .iter()
+        .filter_map(|(key, value)| {
+            let index = key.parse::<usize>().ok()?;
+            let pattern = value
+                .as_dictionary()
+                .and_then(|dict| dict.get("pattern"))
+                .and_then(value_i64)? as u8;
+            Some((index, pattern))
+        })
+        .collect()
+}
+
+fn parse_shape_curves(
+    archive: &KeyedArchive,
+    spatial_hash: &Dictionary,
+    page_height_doc: f32,
+) -> Vec<StrokeCurve> {
+    let Some(shape_bytes) = spatial_hash
+        .get("shapes")
+        .map(|value| archive.deref(value))
+        .and_then(Value::as_data)
+    else {
+        return Vec::new();
+    };
+    let Ok(value) = Value::from_reader(Cursor::new(shape_bytes)) else {
+        return Vec::new();
+    };
+    let Some(root) = value.as_dictionary() else {
+        return Vec::new();
+    };
+    let Some(shapes) = root.get("shapes").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let kinds: Vec<&str> = root
+        .get("kinds")
+        .and_then(Value::as_array)
+        .map(|kinds| kinds.iter().filter_map(Value::as_string).collect())
+        .unwrap_or_default();
+    let mut curves = Vec::new();
+    for (index, shape) in shapes.iter().enumerate() {
+        let Some(shape) = shape.as_dictionary() else {
+            continue;
+        };
+        let kind = kinds.get(index).copied().unwrap_or("");
+        let appearance = shape.get("appearance").and_then(Value::as_dictionary);
+        let stroke_width = appearance
+            .and_then(|appearance| appearance.get("strokeWidth"))
+            .and_then(value_f32)
+            .unwrap_or(1.0);
+        let rgba = appearance
+            .and_then(|appearance| appearance.get("strokeColor"))
+            .and_then(Value::as_dictionary)
+            .and_then(|color| color.get("rgba"))
+            .and_then(parse_rgba_array)
+            .unwrap_or([0, 0, 0, 255]);
+        let style = appearance
+            .and_then(|appearance| appearance.get("style"))
+            .and_then(value_i64)
+            .unwrap_or(3) as u8;
+        let Some((points, preserve_vertices)) = parse_shape_points(kind, shape) else {
+            let Some((x, y, width, height)) = shape.get("rect").and_then(parse_nested_rect) else {
+                continue;
+            };
+            let points = vec![(x, y + height / 2.0), (x + width, y + height / 2.0)];
+            curves.extend(split_curve_into_pages(
+                points,
+                false,
+                stroke_width,
+                rgba,
+                style,
+                None,
+                vec![1.0, 1.0],
+                vec![1.0, 1.0],
+                page_height_doc,
+            ));
+            continue;
+        };
+        let sample_count = bezier_sample_count(points.len());
+        curves.extend(split_curve_into_pages(
+            points,
+            preserve_vertices,
+            stroke_width,
+            rgba,
+            style,
+            None,
+            vec![1.0; sample_count],
+            vec![1.0; sample_count],
+            page_height_doc,
+        ));
+    }
+    curves
+}
+
+fn parse_shape_points(kind: &str, shape: &Dictionary) -> Option<(Vec<(f32, f32)>, bool)> {
+    match kind {
+        "square" | "triangle" | "polygon" => {
+            let mut points = shape
+                .get("points")
+                .and_then(parse_nested_points)
+                .or_else(|| shape.get("rotatedRect").and_then(parse_rotated_rect_points))?;
+            close_shape_points(&mut points, shape.get("isClosed"));
+            Some((points, true))
+        }
+        "circle" => {
+            let (center, radius_x, radius_y) = circle_geometry(shape)?;
+            Some((ellipse_bezier_points(center, radius_x, radius_y), false))
+        }
+        "partialshape" => None,
+        _ => None,
+    }
+}
+
+fn parse_nested_points(value: &Value) -> Option<Vec<(f32, f32)>> {
+    let points = value.as_array()?;
+    let points: Vec<(f32, f32)> = points.iter().filter_map(parse_value_pair).collect();
+    (!points.is_empty()).then_some(points)
+}
+
+fn parse_value_pair(value: &Value) -> Option<(f32, f32)> {
+    let pair = value.as_array()?;
+    Some((value_f32(pair.first()?)?, value_f32(pair.get(1)?)?))
+}
+
+fn parse_rotated_rect_points(value: &Value) -> Option<Vec<(f32, f32)>> {
+    let corners = value
+        .as_dictionary()?
+        .get("corners")
+        .and_then(parse_nested_points)?;
+    Some(corners)
+}
+
+fn close_shape_points(points: &mut Vec<(f32, f32)>, is_closed: Option<&Value>) {
+    if is_closed
+        .and_then(Value::as_boolean)
+        .unwrap_or(false)
+        && points
+            .first()
+            .zip(points.last())
+            .is_some_and(|(first, last)| first != last)
+    {
+        points.push(points[0]);
+    }
+}
+
+fn circle_geometry(shape: &Dictionary) -> Option<((f32, f32), f32, f32)> {
+    if let Some(corners) = shape.get("rotatedRect").and_then(parse_rotated_rect_points) {
+        let (sum_x, sum_y) = corners
+            .iter()
+            .fold((0.0f32, 0.0f32), |(sum_x, sum_y), point| {
+                (sum_x + point.0, sum_y + point.1)
+            });
+        let center = (sum_x / corners.len() as f32, sum_y / corners.len() as f32);
+        let radius_x = corners
+            .first()
+            .zip(corners.get(1))
+            .map(|(a, b)| ((b.0 - a.0).hypot(b.1 - a.1)) * 0.5)?;
+        let radius_y = corners
+            .get(1)
+            .zip(corners.get(2))
+            .map(|(a, b)| ((b.0 - a.0).hypot(b.1 - a.1)) * 0.5)?;
+        return Some((center, radius_x, radius_y));
+    }
+    let (x, y, width, height) = shape.get("rect").and_then(parse_nested_rect)?;
+    Some(((x + width * 0.5, y + height * 0.5), width * 0.5, height * 0.5))
+}
+
+fn ellipse_bezier_points(center: (f32, f32), radius_x: f32, radius_y: f32) -> Vec<(f32, f32)> {
+    let kappa = 0.552_284_8f32;
+    let (cx, cy) = center;
+    vec![
+        (cx + radius_x, cy),
+        (cx + radius_x, cy + radius_y * kappa),
+        (cx + radius_x * kappa, cy + radius_y),
+        (cx, cy + radius_y),
+        (cx - radius_x * kappa, cy + radius_y),
+        (cx - radius_x, cy + radius_y * kappa),
+        (cx - radius_x, cy),
+        (cx - radius_x, cy - radius_y * kappa),
+        (cx - radius_x * kappa, cy - radius_y),
+        (cx, cy - radius_y),
+        (cx + radius_x * kappa, cy - radius_y),
+        (cx + radius_x, cy - radius_y * kappa),
+        (cx + radius_x, cy),
+    ]
+}
+
+fn parse_nested_rect(value: &Value) -> Option<(f32, f32, f32, f32)> {
+    let rect = value.as_array()?;
+    let origin = rect.first()?.as_array()?;
+    let size = rect.get(1)?.as_array()?;
+    Some((
+        value_f32(origin.first()?)?,
+        value_f32(origin.get(1)?)?,
+        value_f32(size.first()?)?,
+        value_f32(size.get(1)?)?,
+    ))
+}
+
+fn parse_rgba_array(value: &Value) -> Option<[u8; 4]> {
+    let rgba = value.as_array()?;
+    if rgba.len() < 4 {
+        return None;
+    }
+    Some([
+        unit_to_u8(value_f32(&rgba[0])?),
+        unit_to_u8(value_f32(&rgba[1])?),
+        unit_to_u8(value_f32(&rgba[2])?),
+        unit_to_u8(value_f32(&rgba[3])?),
+    ])
+}
+
+fn parse_transform(value: &Value) -> Option<[f32; 6]> {
+    let array = value.as_array()?;
+    if array.len() < 6 {
+        return None;
+    }
+    Some([
+        value_f32(&array[0])?,
+        value_f32(&array[1])?,
+        value_f32(&array[2])?,
+        value_f32(&array[3])?,
+        value_f32(&array[4])?,
+        value_f32(&array[5])?,
+    ])
+}
+
+fn apply_transform(point: (f32, f32), transform: Option<[f32; 6]>) -> (f32, f32) {
+    let Some([a, b, c, d, tx, ty]) = transform else {
+        return point;
+    };
+    (a * point.0 + c * point.1 + tx, b * point.0 + d * point.1 + ty)
 }
 
 fn default_if_empty(values: Vec<f32>, count: usize) -> Vec<f32> {
@@ -402,9 +862,11 @@ fn default_if_empty(values: Vec<f32>, count: usize) -> Vec<f32> {
 
 fn split_curve_into_pages(
     points: Vec<(f32, f32)>,
+    preserve_vertices: bool,
     width: f32,
     rgba: [u8; 4],
     style: u8,
+    dash_pattern: Option<u8>,
     pressures: Vec<f32>,
     fractional_widths: Vec<f32>,
     page_height_doc: f32,
@@ -419,9 +881,11 @@ fn split_curve_into_pages(
     {
         return split_bezier_curve_into_pages(
             points,
+            preserve_vertices,
             width,
             rgba,
             style,
+            dash_pattern,
             pressures,
             fractional_widths,
             page_height_doc,
@@ -439,9 +903,11 @@ fn split_curve_into_pages(
             curves.push(StrokeCurve {
                 page_index: current_page,
                 points: current_points,
+                preserve_vertices,
                 width,
                 rgba,
                 style,
+                dash_pattern,
                 pressures: current_pressures,
                 fractional_widths: current_fractional,
             });
@@ -460,9 +926,11 @@ fn split_curve_into_pages(
         curves.push(StrokeCurve {
             page_index: current_page,
             points: current_points,
+            preserve_vertices,
             width,
             rgba,
             style,
+            dash_pattern,
             pressures: current_pressures,
             fractional_widths: current_fractional,
         });
@@ -472,9 +940,11 @@ fn split_curve_into_pages(
 
 fn split_bezier_curve_into_pages(
     points: Vec<(f32, f32)>,
+    preserve_vertices: bool,
     width: f32,
     rgba: [u8; 4],
     style: u8,
+    dash_pattern: Option<u8>,
     pressures: Vec<f32>,
     fractional_widths: Vec<f32>,
     page_height_doc: f32,
@@ -495,9 +965,11 @@ fn split_bezier_curve_into_pages(
                 curves.push(StrokeCurve {
                     page_index: page,
                     points: current_points,
+                    preserve_vertices,
                     width,
                     rgba,
                     style,
+                    dash_pattern,
                     pressures: current_pressures,
                     fractional_widths: current_fractional,
                 });
@@ -522,9 +994,11 @@ fn split_bezier_curve_into_pages(
         curves.push(StrokeCurve {
             page_index: page,
             points: current_points,
+            preserve_vertices,
             width,
             rgba,
             style,
+            dash_pattern,
             pressures: current_pressures,
             fractional_widths: current_fractional,
         });
@@ -556,18 +1030,27 @@ fn parse_handwriting_color(raw: &[u8]) -> [u8; 4] {
     }
 }
 
-fn unpack_f32(value: Option<&Value>) -> Vec<f32> {
-    value
-        .and_then(Value::as_data)
+fn value_data<'a>(
+    archive: Option<&'a KeyedArchive>,
+    value: Option<&'a Value>,
+) -> Option<&'a [u8]> {
+    let value = value?;
+    let value = archive
+        .map(|archive| archive.deref(value))
+        .unwrap_or(value);
+    value.as_data()
+}
+
+fn unpack_f32(archive: Option<&KeyedArchive>, value: Option<&Value>) -> Vec<f32> {
+    value_data(archive, value)
         .unwrap_or(&[])
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
         .collect()
 }
 
-fn unpack_i32(value: Option<&Value>) -> Vec<i32> {
-    value
-        .and_then(Value::as_data)
+fn unpack_i32(archive: Option<&KeyedArchive>, value: Option<&Value>) -> Vec<i32> {
+    value_data(archive, value)
         .unwrap_or(&[])
         .chunks_exact(4)
         .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))

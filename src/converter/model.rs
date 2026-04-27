@@ -27,7 +27,17 @@ impl OutputFormat {
 #[derive(Clone, Debug)]
 pub(crate) struct TextStyle {
     pub(crate) font_size: f32,
+    pub(crate) font_name: String,
     pub(crate) color: [u8; 4],
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) underline: bool,
+    pub(crate) strikethrough: bool,
+    pub(crate) baseline_offset: f32,
+    pub(crate) indent_level: Option<usize>,
+    pub(crate) indent_decoration_style: Option<i64>,
+    pub(crate) indent_decoration_number: Option<i64>,
+    pub(crate) checklist_checked: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -38,23 +48,47 @@ pub(crate) struct TextSpan {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct TextBlock {
+    pub(crate) page_index: usize,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+    pub(crate) text: String,
+    pub(crate) text_spans: Vec<TextSpan>,
+    pub(crate) z_index: i64,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct MediaImage {
     pub(crate) page_index: usize,
     pub(crate) x: f32,
     pub(crate) y: f32,
     pub(crate) width: f32,
     pub(crate) height: f32,
+    pub(crate) rotation_degrees: f32,
     pub(crate) relative_path: String,
     pub(crate) z_index: i64,
+    pub(crate) crop: Option<ImageCrop>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImageCrop {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
+    pub(crate) height: f32,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct StrokeCurve {
     pub(crate) page_index: usize,
     pub(crate) points: Vec<(f32, f32)>,
+    pub(crate) preserve_vertices: bool,
     pub(crate) width: f32,
     pub(crate) rgba: [u8; 4],
     pub(crate) style: u8,
+    pub(crate) dash_pattern: Option<u8>,
     pub(crate) pressures: Vec<f32>,
     pub(crate) fractional_widths: Vec<f32>,
 }
@@ -76,6 +110,7 @@ pub(crate) struct NoteDocument {
     pub(crate) line_style: Option<String>,
     pub(crate) text: String,
     pub(crate) text_spans: Vec<TextSpan>,
+    pub(crate) text_blocks: Vec<TextBlock>,
     pub(crate) media_images: Vec<MediaImage>,
     pub(crate) pdf_pages: Vec<EmbeddedPdfPage>,
     pub(crate) curves: Vec<StrokeCurve>,
