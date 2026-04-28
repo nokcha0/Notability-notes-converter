@@ -412,6 +412,14 @@ fn parse_media_images(
                 .and_then(value_f32)
                 .map(normalize_rotation_degrees)
                 .unwrap_or(0.0),
+            flipped_horizontal: media
+                .get("isFlippedHorizontal")
+                .and_then(Value::as_boolean)
+                .unwrap_or(false),
+            flipped_vertical: media
+                .get("isFlippedVertical")
+                .and_then(Value::as_boolean)
+                .unwrap_or(false),
             relative_path,
             z_index: media.get("zIndex").and_then(value_i64).unwrap_or(0),
             crop,
@@ -734,8 +742,16 @@ fn parse_shape_points(kind: &str, shape: &Dictionary) -> Option<(Vec<(f32, f32)>
             Some((ellipse_bezier_points(center, radius_x, radius_y), false))
         }
         "partialshape" => None,
+        "line" => Some((parse_shape_line_points(shape)?, true)),
         _ => None,
     }
+}
+
+fn parse_shape_line_points(shape: &Dictionary) -> Option<Vec<(f32, f32)>> {
+    Some(vec![
+        shape.get("startPt").and_then(parse_value_pair)?,
+        shape.get("endPt").and_then(parse_value_pair)?,
+    ])
 }
 
 fn parse_nested_points(value: &Value) -> Option<Vec<(f32, f32)>> {

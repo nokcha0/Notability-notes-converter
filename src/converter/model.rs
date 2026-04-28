@@ -68,6 +68,8 @@ pub(crate) struct MediaImage {
     pub(crate) width: f32,
     pub(crate) height: f32,
     pub(crate) rotation_degrees: f32,
+    pub(crate) flipped_horizontal: bool,
+    pub(crate) flipped_vertical: bool,
     pub(crate) relative_path: String,
     pub(crate) z_index: i64,
     pub(crate) crop: Option<ImageCrop>,

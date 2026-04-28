@@ -242,6 +242,18 @@ fn write_page(
         let angle = -media.rotation_degrees.to_radians();
         let cos = angle.cos();
         let sin = angle.sin();
+        let image_scale_x = if media.flipped_horizontal { -width } else { width };
+        let image_scale_y = if media.flipped_vertical { -height } else { height };
+        let image_offset_x = if media.flipped_horizontal {
+            width * 0.5
+        } else {
+            -width * 0.5
+        };
+        let image_offset_y = if media.flipped_vertical {
+            height * 0.5
+        } else {
+            -height * 0.5
+        };
         operations.extend([
             Operation::new("q", vec![]),
             Operation::new(
@@ -269,12 +281,12 @@ fn write_page(
             Operation::new(
                 "cm",
                 vec![
-                    width.into(),
+                    image_scale_x.into(),
                     0.into(),
                     0.into(),
-                    height.into(),
-                    (-width * 0.5).into(),
-                    (-height * 0.5).into(),
+                    image_scale_y.into(),
+                    image_offset_x.into(),
+                    image_offset_y.into(),
                 ],
             ),
             Operation::new("Do", vec![name.into()]),
@@ -1189,7 +1201,7 @@ fn push_stroke_state(
 
 fn dash_lengths(pattern: u8, style: u8, width: f32) -> (f32, f32) {
     match (pattern, style == STROKE_STYLE_HIGHLIGHTER) {
-        (1, true) => ((width * 2.0).max(2.0), (width * 1.4).max(1.4)),
+        (1, true) => ((width * 2.0).max(2.0), (width * 2.1).max(1.8)),
         (2, true) => ((width * 0.12).max(0.12), (width * 1.8).max(1.8)),
         (1, false) => ((width * 0.12).max(0.12), (width * 2.1).max(1.2)),
         (2, false) => ((width * 0.12).max(0.12), (width * 1.6).max(0.9)),
@@ -1794,12 +1806,23 @@ fn draw_svg_images(
         let y = media.y * doc_to_pt;
         let width = media.width * doc_to_pt;
         let height = media.height * doc_to_pt;
-        let transform = if media.rotation_degrees.abs() > f32::EPSILON {
+        let center_x = x + width * 0.5;
+        let center_y = y + height * 0.5;
+        let scale_x = if media.flipped_horizontal { -1.0 } else { 1.0 };
+        let scale_y = if media.flipped_vertical { -1.0 } else { 1.0 };
+        let transform = if media.rotation_degrees.abs() > f32::EPSILON
+            || media.flipped_horizontal
+            || media.flipped_vertical
+        {
             format!(
-                " transform=\"rotate({:.4} {:.2} {:.2})\"",
+                " transform=\"translate({:.2} {:.2}) rotate({:.4}) scale({:.1} {:.1}) translate({:.2} {:.2})\"",
+                center_x,
+                center_y,
                 media.rotation_degrees,
-                x + width * 0.5,
-                y + height * 0.5
+                scale_x,
+                scale_y,
+                -center_x,
+                -center_y
             )
         } else {
             String::new()
