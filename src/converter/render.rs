@@ -15,6 +15,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::Path;
 use zip::ZipArchive;
@@ -40,6 +41,7 @@ fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) ->
     let mut output = Document::with_version("1.5");
     let mut max_id = 1u32;
     let mut loaded_pdfs: BTreeMap<String, Document> = BTreeMap::new();
+    let mut image_cache = ImageXObjectCache::new();
     for relative_path in note
         .pdf_pages
         .iter()
@@ -68,6 +70,7 @@ fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) ->
             note,
             &loaded_pdfs,
             &fonts,
+            &mut image_cache,
             pages_id,
             page_index,
         )?;
@@ -106,6 +109,16 @@ struct PdfFonts {
     times_italic: ObjectId,
     times_bold_italic: ObjectId,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ImageCacheKey {
+    data_hash: u64,
+    data_len: usize,
+    crop: Option<[u32; 4]>,
+    is_jpeg: bool,
+}
+
+type ImageXObjectCache = BTreeMap<ImageCacheKey, ObjectId>;
 
 impl PdfFonts {
     fn resources(&self) -> [(&'static str, ObjectId); 12] {
@@ -156,6 +169,7 @@ fn write_page(
     note: &NoteDocument,
     loaded_pdfs: &BTreeMap<String, Document>,
     fonts: &PdfFonts,
+    image_cache: &mut ImageXObjectCache,
     pages_id: ObjectId,
     page_index: usize,
 ) -> Result<ObjectId> {
@@ -230,7 +244,7 @@ fn write_page(
         .enumerate()
     {
         let name = format!("Im{image_index}");
-        let image_id = add_image_xobject(output, bundle, note, media)?;
+        let image_id = add_image_xobject(output, bundle, note, media, image_cache)?;
         xobjects.set(name.clone(), image_id);
         let x = (content_inset_doc + media.x) * doc_to_pt;
         let y = media.y * doc_to_pt;
@@ -868,15 +882,19 @@ fn add_image_xobject(
     bundle: &mut ZipArchive<File>,
     note: &NoteDocument,
     media: &super::model::MediaImage,
+    image_cache: &mut ImageXObjectCache,
 ) -> Result<ObjectId> {
     let path = note.bundle_root.clone() + &media.relative_path;
     let data = read_zip_entry(bundle, &path)?;
+    let is_jpeg = is_jpeg_path(&media.relative_path);
+    let cache_key = image_cache_key(&data, media, is_jpeg);
+    if let Some(image_id) = image_cache.get(&cache_key) {
+        return Ok(*image_id);
+    }
     let image = load_media_image(&data, media)?;
     let (width, height) = image.dimensions();
     let rgb = image.to_rgb8();
     let mut content = Vec::new();
-    let is_jpeg = media.relative_path.to_ascii_lowercase().ends_with(".jpg")
-        || media.relative_path.to_ascii_lowercase().ends_with(".jpeg");
     let filter = if is_jpeg {
         let mut encoder = JpegEncoder::new_with_quality(&mut content, 88);
         encoder.encode(rgb.as_raw(), width, height, ExtendedColorType::Rgb8)?;
@@ -887,7 +905,7 @@ fn add_image_xobject(
         content = encoder.finish()?;
         "FlateDecode"
     };
-    Ok(output.add_object(Stream::new(
+    let image_id = output.add_object(Stream::new(
         dictionary! {
             "Type" => "XObject",
             "Subtype" => "Image",
@@ -898,7 +916,40 @@ fn add_image_xobject(
             "Filter" => filter,
         },
         content,
-    )))
+    ));
+    image_cache.insert(cache_key, image_id);
+    Ok(image_id)
+}
+
+fn image_cache_key(
+    data: &[u8],
+    media: &super::model::MediaImage,
+    is_jpeg: bool,
+) -> ImageCacheKey {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hasher);
+    ImageCacheKey {
+        data_hash: hasher.finish(),
+        data_len: data.len(),
+        crop: media.crop.map(|crop| {
+            [
+                crop.x.to_bits(),
+                crop.y.to_bits(),
+                crop.width.to_bits(),
+                crop.height.to_bits(),
+            ]
+        }),
+        is_jpeg,
+    }
+}
+
+fn is_jpeg_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg")
+        })
 }
 
 fn load_media_image(data: &[u8], media: &super::model::MediaImage) -> Result<DynamicImage> {

@@ -480,7 +480,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "notability2pdf"
+name = "notability-converter"
 version = "0.1.0"
 dependencies = [
  "flate2",

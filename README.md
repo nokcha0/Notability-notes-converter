@@ -47,41 +47,96 @@ cargo run -- --format svg --input path/to/input --output path/to/output
 
 Thanks to [Julia Evans' blog](https://jvns.ca/blog/2018/03/31/reverse-engineering-notability-format/), I was able to quickly understand how the file format works.
 
-A `.note` file is a ZIP archive containing:
+A `.note` file is a ZIP archive with a document folder inside it. The folder name does not have to match the file name, so locate `Session.plist` first and treat its parent folder as the bundle root. Typical contents are:
 
 - `Session.plist`: the main document object graph
-- `PDFs/`: imported PDF source files
-- image assets referenced by embedded figures
-- thumbnail PNGs used as a fallback for page aspect ratios
+- `Images/`: embedded image files referenced by figure objects
+- `PDFs/`: imported PDF files used as page backgrounds
+- `thumb*.png`: thumbnails, useful as a fallback for page aspect ratio
+- `metadata.plist`, `Recordings/`, and similar side files
 
-`Session.plist` is not a flat plist. It is an Apple keyed archive containing `$objects` and `$top`, so decoding it requires following UID references through the object table.
+`Session.plist` is an Apple keyed archive, not a plain property-list tree. The top-level plist contains `$objects` and `$top`. Values are often `UID` references into `$objects`, so a reader needs to resolve UIDs before interpreting fields. Archived arrays and dictionaries often appear as Objective-C shapes such as `NS.objects`, `NS.keys`, and `NS.bytes`.
 
-The main content is stored in:
+Most useful page and drawing data is under `richText`.
 
-- `richText`: the main content container
-- `richText -> reflowState`: contains layout information, such as `pageWidthInDocumentCoordsKey`
-- `richText -> attributedString`: stores the plain text and style subranges
-- `richText -> mediaObjects`: stores placed images, including their document coordinates, size, and z-order
-- `richText -> pageLayoutArray`: maps note pages to imported PDF files and their source page indices
-- `richText -> Handwriting Overlay -> SpatialHash`: stores pen stroke payloads
+Geometry fields define how document coordinates become pages:
 
-The handwriting payload in `SpatialHash` mostly consists of little-endian binary arrays:
+- `richText -> reflowState -> pageWidthInDocumentCoordsKey`: document-space page width
+- paper attributes: paper size, line style, and page sizing hints
+- `pageLayoutArray`: imported PDF pages, whose page boxes can define the output ratio
+- `thumb*.png`: fallback aspect ratio when no source PDF is available
 
-- `curvespoints`: `f32` pairs representing stroke point coordinates
-- `curvesnumpoints`: `i32` point counts for each stroke
-- `curveswidth`: base stroke widths stored as `f32`
-- `curvesforces`: pressure samples stored as `f32`
-- `curvesfractionalwidths`: width multipliers stored as `f32`
-- `curvescolors`: RGBA bytes
-- `curvesstyles`: per-stroke tool/style identifiers
+Notability stores content in one continuous vertical document coordinate space. To convert it to pages, choose a page height from the geometry above, then split any item by:
 
-Many strokes follow a cubic Bézier layout where the point count follows `1 + 3n`, so the data is not simply a plain polyline list.
+```text
+page_index = floor(document_y / page_height)
+local_y = document_y - page_index * page_height
+```
 
-Page geometry is reconstructed from:
+Text appears in two forms:
 
-- the explicit document width from `reflowState`
-- imported PDF page boxes, when the note is PDF-backed
-- the thumbnail aspect ratio as a fallback when no embedded PDF page defines the height
-- paper attributes, such as line style, paper size, and sizing behavior
+- `richText -> attributedString`: the main text stream
+- `TextBlockMediaObject` entries in `mediaObjects`: positioned text boxes
 
-This is enough to reconstruct the sample notes.
+The attributed string stores plain text in `stringKey` and style runs in `subRangesKey`. Useful style fields include:
+
+- `NSFontSizeAttribute` and `NSFontNameAttribute`
+- `subRangeColorCrossPlatformKey` or `subRangeColorKey`
+- underline, strikethrough, and baseline offset in `subRangeOtherAttributesKey`
+- list/checklist metadata such as `indent-level`, `indent-decoration-style`, `indent-decoration-number`, and `checklist-checked`
+
+To convert text, reconstruct a per-character style map from the ranges, then lay out the text in document coordinates. This is the least exact part of the format because Notability's native font shaping and wrapping are not stored as final glyph positions.
+
+Images are `mediaObjects` with nested figure/background/snapshot objects pointing to files in `Images/`. Important fields are:
+
+- `documentOrigin`: document-space position
+- `unscaledContentSize`: displayed size
+- `rotationDegrees`: rotation; some files store radians despite the name
+- `isFlippedHorizontal` and `isFlippedVertical`: independent mirror flags
+- `FigureCropRectKey`: crop rectangle in source-image pixels
+- `zIndex`: layer order
+
+To convert images, read the referenced asset from `Images/`, crop it if `FigureCropRectKey` exists, then place it at `documentOrigin` with size, rotation, and flips applied around the displayed image center.
+
+Imported PDF backgrounds are described by `richText -> pageLayoutArray`. Each entry maps:
+
+- note page index
+- source PDF filename under `PDFs/`
+- source page index inside that PDF
+
+To convert a PDF-backed page, use the source PDF page as the base layer, scale it to the reconstructed output page box, then draw the note overlays above it.
+
+Handwriting is stored under `richText -> Handwriting Overlay -> SpatialHash`. The main stroke payloads are little-endian binary arrays:
+
+- `curvespoints`: `f32` x/y point pairs
+- `curvesnumpoints`: `i32` point counts per curve
+- `curveswidth`: base stroke widths as `f32`
+- `curvesforces`: pressure samples as `f32`
+- `curvesfractionalwidths`: width multipliers as `f32`
+- `curvescolors`: raw RGBA bytes
+- `curvesstyles`: tool/style ids
+- `dashStyles`: dash/dot pattern metadata keyed by curve index
+- `groupsArrays`: nested stroke groups with transforms
+- `shapes`: simple shape strokes
+
+Many curves are cubic Bezier chains: the point count follows `1 + 3n`, where each segment uses one start point and three more points. Pressure and fractional-width arrays may align to the Bezier sample count rather than the raw point count. A converter should preserve that pressure data for pen and pencil width/opacity.
+
+Dash and dot patterns live in `dashStyles -> objectPatterns -> <curve-index> -> pattern`. Keep the original curve index when attaching dash metadata; filtering or reordering curves too early can assign dotted styles to the wrong stroke.
+
+Grouped handwriting in `groupsArrays` has its own nested archive data plus a transform. Apply the group transform to stroke coordinates. Scale stroke width by the transform as well, otherwise grouped strokes render too thick or too thin.
+
+Shape strokes are separate from normal raw curves:
+
+- `square`, `triangle`, and `polygon` use explicit point lists
+- `circle` uses `rotatedRect` or `rect`
+- `line` uses `startPt` and `endPt`; do not derive it from `rect`, or angled lines become horizontal
+- `partialshape` appears related to partial erase / cleaned-up shape data and is not fully understood
+
+Layering is reconstructed from page backgrounds first, then text, text blocks, images, and handwriting according to the parsed order and z-order where available.
+
+Important limitations when converting:
+
+- text layout is heuristic because exact Notability glyph shaping is not fully encoded
+- partial erase behavior is only partly understood
+- highlighter dotted/dashed strokes can differ from Notability's exported PDF because the export may use filled fragments instead of native dash arrays
+- image rotation, crop, and horizontal/vertical flips are separate fields and all must be applied
