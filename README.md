@@ -4,6 +4,8 @@ Converts `.note` files to `.pdf` by default, or optionally to `.svg`.
 
 I originally made this for personal use because I couldn't find a converter online. I hope it is useful to others as well.
 
+Note: output is not perfectly identical to Notability’s official export. Some details, such as Apple-specific fonts and exact text layout are approximated, but for most notes this converter works pretty well.
+
 ## Where is this useful?
 
 - Convert `.note` files to other formats in bulk (high speed is a plus)
@@ -96,7 +98,7 @@ Images are `mediaObjects` with nested figure/background/snapshot objects pointin
 - `FigureCropRectKey`: crop rectangle in source-image pixels
 - `zIndex`: layer order
 
-To convert images, read the referenced asset from `Images/`, crop it if `FigureCropRectKey` exists, then place it at `documentOrigin` with size, rotation, and flips applied around the displayed image center.
+To convert images, read the referenced asset from `Images/`, crop it if `FigureCropRectKey` exists, then place it at `documentOrigin` with size, rotation, and flips applied around the displayed image center. If a referenced RGB JPEG is uncropped or the crop covers the entire source image, it can be embedded directly in the output PDF instead of being decoded and re-encoded.
 
 Imported PDF backgrounds are described by `richText -> pageLayoutArray`. Each entry maps:
 
@@ -130,13 +132,13 @@ Shape strokes are separate from normal raw curves:
 - `square`, `triangle`, and `polygon` use explicit point lists
 - `circle` uses `rotatedRect` or `rect`
 - `line` uses `startPt` and `endPt`; do not derive it from `rect`, or angled lines become horizontal
-- `partialshape` appears related to partial erase / cleaned-up shape data and is not fully understood
+- `partialshape` represents partially erased shape/line fragments; use its `strokePath` outline as a filled path to preserve the erased gap size
 
 Layering is reconstructed from page backgrounds first, then text, text blocks, images, and handwriting according to the parsed order and z-order where available.
 
 Important limitations when converting:
 
 - text layout is heuristic because exact Notability glyph shaping is not fully encoded
-- partial erase behavior is only partly understood
+- raw partial erase behavior is only partly understood, but `partialshape` fragments preserve erased size for partially erased shapes/lines
 - highlighter dotted/dashed strokes can differ from Notability's exported PDF because the export may use filled fragments instead of native dash arrays
 - image rotation, crop, and horizontal/vertical flips are separate fields and all must be applied

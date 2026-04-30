@@ -1,7 +1,10 @@
 [package]
-name = "notability2pdf"
+name = "notability-converter"
 version = "0.1.0"
 edition = "2021"
+
+[profile.dev]
+opt-level = 2
 
 [dependencies]
 flate2 = "1"

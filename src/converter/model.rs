@@ -88,6 +88,8 @@ pub(crate) struct StrokeCurve {
     pub(crate) page_index: usize,
     pub(crate) points: Vec<(f32, f32)>,
     pub(crate) preserve_vertices: bool,
+    pub(crate) path_commands: Vec<u8>,
+    pub(crate) fill_path: bool,
     pub(crate) width: f32,
     pub(crate) rgba: [u8; 4],
     pub(crate) style: u8,

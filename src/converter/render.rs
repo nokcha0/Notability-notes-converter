@@ -89,8 +89,10 @@ fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) ->
         "Pages" => pages_id,
     });
     output.trailer.set("Root", catalog_id);
-    output.prune_objects();
-    output.renumber_objects();
+    if !loaded_pdfs.is_empty() {
+        output.prune_objects();
+        output.renumber_objects();
+    }
     output.save(output_path)?;
     Ok(())
 }
@@ -891,6 +893,24 @@ fn add_image_xobject(
     if let Some(image_id) = image_cache.get(&cache_key) {
         return Ok(*image_id);
     }
+    if is_jpeg {
+        if let Some((width, height)) = direct_jpeg_dimensions(&data, media) {
+            let image_id = output.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => width as i64,
+                    "Height" => height as i64,
+                    "ColorSpace" => "DeviceRGB",
+                    "BitsPerComponent" => 8,
+                    "Filter" => "DCTDecode",
+                },
+                data,
+            ));
+            image_cache.insert(cache_key, image_id);
+            return Ok(image_id);
+        }
+    }
     let image = load_media_image(&data, media)?;
     let (width, height) = image.dimensions();
     let rgb = image.to_rgb8();
@@ -950,6 +970,76 @@ fn is_jpeg_path(path: &str) -> bool {
         .is_some_and(|extension| {
             extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg")
         })
+}
+
+fn direct_jpeg_dimensions(data: &[u8], media: &super::model::MediaImage) -> Option<(u16, u16)> {
+    let (width, height, components) = jpeg_dimensions(data)?;
+    if components != 3 {
+        return None;
+    }
+    if !crop_covers_image(media.crop, width, height) {
+        return None;
+    }
+    Some((width, height))
+}
+
+fn crop_covers_image(
+    crop: Option<super::model::ImageCrop>,
+    image_width: u16,
+    image_height: u16,
+) -> bool {
+    let Some(crop) = crop else {
+        return true;
+    };
+    crop.x <= 0.5
+        && crop.y <= 0.5
+        && crop.width + crop.x >= image_width as f32 - 0.5
+        && crop.height + crop.y >= image_height as f32 - 0.5
+}
+
+fn jpeg_dimensions(data: &[u8]) -> Option<(u16, u16, u8)> {
+    if data.len() < 4 || data[0] != 0xff || data[1] != 0xd8 {
+        return None;
+    }
+    let mut cursor = 2usize;
+    while cursor + 4 <= data.len() {
+        while cursor < data.len() && data[cursor] == 0xff {
+            cursor += 1;
+        }
+        if cursor >= data.len() {
+            return None;
+        }
+        let marker = data[cursor];
+        cursor += 1;
+        if marker == 0xd9 || marker == 0xda {
+            return None;
+        }
+        if cursor + 2 > data.len() {
+            return None;
+        }
+        let length = u16::from_be_bytes(data.get(cursor..cursor + 2)?.try_into().ok()?) as usize;
+        if length < 2 || cursor + length > data.len() {
+            return None;
+        }
+        if is_jpeg_sof_marker(marker) {
+            if length < 7 {
+                return None;
+            }
+            let height = u16::from_be_bytes(data.get(cursor + 3..cursor + 5)?.try_into().ok()?);
+            let width = u16::from_be_bytes(data.get(cursor + 5..cursor + 7)?.try_into().ok()?);
+            let components = *data.get(cursor + 7)?;
+            return (width > 0 && height > 0).then_some((width, height, components));
+        }
+        cursor += length;
+    }
+    None
+}
+
+fn is_jpeg_sof_marker(marker: u8) -> bool {
+    matches!(
+        marker,
+        0xc0 | 0xc1 | 0xc2 | 0xc3 | 0xc5 | 0xc6 | 0xc7 | 0xc9 | 0xca | 0xcb | 0xcd | 0xce | 0xcf
+    )
 }
 
 fn load_media_image(data: &[u8], media: &super::model::MediaImage) -> Result<DynamicImage> {
@@ -1054,6 +1144,19 @@ fn draw_pen_curve(
     if curve.points.is_empty() {
         return;
     }
+    if curve.fill_path {
+        draw_filled_curve(
+            operations,
+            output,
+            ext_gstates,
+            ext_cache,
+            curve,
+            doc_to_pt,
+            content_inset_doc,
+            page_height,
+        );
+        return;
+    }
     if curve.style == STROKE_STYLE_HIGHLIGHTER
         && curve.dash_pattern.is_some()
         && curve_path_extent(curve) < curve.width * 0.25
@@ -1079,6 +1182,43 @@ fn draw_pen_curve(
         operations.push(Operation::new("S", vec![]));
     }
     operations.push(Operation::new("Q", vec![]));
+}
+
+fn draw_filled_curve(
+    operations: &mut Vec<Operation>,
+    output: &mut Document,
+    ext_gstates: &mut Dictionary,
+    ext_cache: &mut BTreeMap<(u16, bool), String>,
+    curve: &StrokeCurve,
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+    page_height: f32,
+) {
+    let points = stroke_points_pt(curve, doc_to_pt, content_inset_doc, page_height);
+    let multiply = curve.style == STROKE_STYLE_HIGHLIGHTER;
+    let gs = ext_gstate_name(
+        output,
+        ext_gstates,
+        ext_cache,
+        curve.rgba[3] as f32 / 255.0,
+        multiply,
+    );
+    operations.extend([
+        Operation::new("q", vec![]),
+        Operation::new("gs", vec![gs.into()]),
+        Operation::new(
+            "rg",
+            vec![
+                (curve.rgba[0] as f32 / 255.0).into(),
+                (curve.rgba[1] as f32 / 255.0).into(),
+                (curve.rgba[2] as f32 / 255.0).into(),
+            ],
+        ),
+    ]);
+    if !draw_encoded_path(operations, &curve.path_commands, &points) {
+        draw_path(operations, curve, &points);
+    }
+    operations.extend([Operation::new("f", vec![]), Operation::new("Q", vec![])]);
 }
 
 fn draw_pressure_pen_curve(
@@ -1313,6 +1453,56 @@ fn draw_path(operations: &mut Vec<Operation>, curve: &StrokeCurve, points: &[(f3
             ));
         }
     }
+}
+
+fn draw_encoded_path(
+    operations: &mut Vec<Operation>,
+    commands: &[u8],
+    points: &[(f32, f32)],
+) -> bool {
+    if commands.is_empty() {
+        return false;
+    }
+    let mut index = 0usize;
+    for command in commands {
+        match *command {
+            0 => {
+                let Some(point) = points.get(index) else {
+                    return false;
+                };
+                operations.push(Operation::new("m", vec![point.0.into(), point.1.into()]));
+                index += 1;
+            }
+            1 => {
+                let Some(point) = points.get(index) else {
+                    return false;
+                };
+                operations.push(Operation::new("l", vec![point.0.into(), point.1.into()]));
+                index += 1;
+            }
+            3 => {
+                let (Some(c1), Some(c2), Some(end)) =
+                    (points.get(index), points.get(index + 1), points.get(index + 2))
+                else {
+                    return false;
+                };
+                operations.push(Operation::new(
+                    "c",
+                    vec![
+                        c1.0.into(),
+                        c1.1.into(),
+                        c2.0.into(),
+                        c2.1.into(),
+                        end.0.into(),
+                        end.1.into(),
+                    ],
+                ));
+                index += 3;
+            }
+            _ => return false,
+        }
+    }
+    index == points.len()
 }
 
 fn smoothed_cubic_segments(points: &[(f32, f32)]) -> Vec<((f32, f32), (f32, f32), (f32, f32))> {
@@ -1948,6 +2138,17 @@ fn draw_svg_pen_curve(
     let points = stroke_points_svg(curve, doc_to_pt, content_inset_doc);
     let alpha = curve.rgba[3] as f32 / 255.0;
     let multiply = curve.style == STROKE_STYLE_HIGHLIGHTER;
+    if curve.fill_path {
+        write!(
+            svg,
+            "<path d=\"{}\" fill=\"{}\" fill-opacity=\"{:.3}\"{} />",
+            svg_path_data(curve, &points),
+            svg_rgb(curve.rgba),
+            alpha,
+            svg_blend_attr(multiply)
+        )?;
+        return Ok(());
+    }
     if points.len() == 1 {
         let radius = (curve.width * doc_to_pt / 2.0).max(0.5);
         write!(
@@ -2065,6 +2266,9 @@ fn stroke_points_svg(
 }
 
 fn svg_path_data(curve: &StrokeCurve, points: &[(f32, f32)]) -> String {
+    if !curve.path_commands.is_empty() {
+        return svg_encoded_path_data(&curve.path_commands, points);
+    }
     let mut data = String::new();
     let _ = write!(data, "M {:.2} {:.2}", points[0].0, points[0].1);
     if curve.preserve_vertices || points.len() == 2 {
@@ -2089,6 +2293,44 @@ fn svg_path_data(curve: &StrokeCurve, points: &[(f32, f32)]) -> String {
                 " C {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}",
                 c1.0, c1.1, c2.0, c2.1, end.0, end.1
             );
+        }
+    }
+    data
+}
+
+fn svg_encoded_path_data(commands: &[u8], points: &[(f32, f32)]) -> String {
+    let mut data = String::new();
+    let mut index = 0usize;
+    for command in commands {
+        match *command {
+            0 => {
+                let Some(point) = points.get(index) else {
+                    return data;
+                };
+                let _ = write!(data, "M {:.2} {:.2}", point.0, point.1);
+                index += 1;
+            }
+            1 => {
+                let Some(point) = points.get(index) else {
+                    return data;
+                };
+                let _ = write!(data, " L {:.2} {:.2}", point.0, point.1);
+                index += 1;
+            }
+            3 => {
+                let (Some(c1), Some(c2), Some(end)) =
+                    (points.get(index), points.get(index + 1), points.get(index + 2))
+                else {
+                    return data;
+                };
+                let _ = write!(
+                    data,
+                    " C {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}",
+                    c1.0, c1.1, c2.0, c2.1, end.0, end.1
+                );
+                index += 3;
+            }
+            _ => return data,
         }
     }
     data

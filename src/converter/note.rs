@@ -693,6 +693,37 @@ fn parse_shape_curves(
             .and_then(|appearance| appearance.get("style"))
             .and_then(value_i64)
             .unwrap_or(3) as u8;
+        if kind == "partialshape" {
+            let Some((path_commands, points)) = shape
+                .get("strokePath")
+                .and_then(Value::as_data)
+                .and_then(parse_notability_path)
+            else {
+                continue;
+            };
+            let page_index = points
+                .first()
+                .map(|point| (point.1 / page_height_doc).floor() as usize)
+                .unwrap_or(0);
+            let points: Vec<(f32, f32)> = points
+                .into_iter()
+                .map(|point| localize(point, page_index, page_height_doc))
+                .collect();
+            curves.push(StrokeCurve {
+                page_index,
+                points,
+                preserve_vertices: true,
+                path_commands,
+                fill_path: true,
+                width: stroke_width,
+                rgba,
+                style,
+                dash_pattern: None,
+                pressures: Vec::new(),
+                fractional_widths: Vec::new(),
+            });
+            continue;
+        }
         let Some((points, preserve_vertices)) = parse_shape_points(kind, shape) else {
             let Some((x, y, width, height)) = shape.get("rect").and_then(parse_nested_rect) else {
                 continue;
@@ -741,10 +772,35 @@ fn parse_shape_points(kind: &str, shape: &Dictionary) -> Option<(Vec<(f32, f32)>
             let (center, radius_x, radius_y) = circle_geometry(shape)?;
             Some((ellipse_bezier_points(center, radius_x, radius_y), false))
         }
-        "partialshape" => None,
         "line" => Some((parse_shape_line_points(shape)?, true)),
         _ => None,
     }
+}
+
+fn parse_notability_path(data: &[u8]) -> Option<(Vec<u8>, Vec<(f32, f32)>)> {
+    if data.len() < 8 {
+        return None;
+    }
+    let command_count = u32::from_le_bytes(data.get(4..8)?.try_into().ok()?) as usize;
+    let commands = data.get(8..8 + command_count)?.to_vec();
+    let point_count = commands.iter().try_fold(0usize, |count, command| {
+        match command {
+            0 | 1 => Some(count + 1),
+            3 => Some(count + 3),
+            _ => None,
+        }
+    })?;
+    let point_bytes = data.get(8 + command_count..)?;
+    if point_bytes.len() != point_count * 16 {
+        return None;
+    }
+    let mut points = Vec::with_capacity(point_count);
+    for chunk in point_bytes.chunks_exact(16) {
+        let x = f64::from_le_bytes(chunk.get(0..8)?.try_into().ok()?) as f32;
+        let y = f64::from_le_bytes(chunk.get(8..16)?.try_into().ok()?) as f32;
+        points.push((x, y));
+    }
+    Some((commands, points))
 }
 
 fn parse_shape_line_points(shape: &Dictionary) -> Option<Vec<(f32, f32)>> {
@@ -936,6 +992,8 @@ fn split_curve_into_pages(
                 page_index: current_page,
                 points: current_points,
                 preserve_vertices,
+                path_commands: Vec::new(),
+                fill_path: false,
                 width,
                 rgba,
                 style,
@@ -959,6 +1017,8 @@ fn split_curve_into_pages(
             page_index: current_page,
             points: current_points,
             preserve_vertices,
+            path_commands: Vec::new(),
+            fill_path: false,
             width,
             rgba,
             style,
@@ -998,6 +1058,8 @@ fn split_bezier_curve_into_pages(
                     page_index: page,
                     points: current_points,
                     preserve_vertices,
+                    path_commands: Vec::new(),
+                    fill_path: false,
                     width,
                     rgba,
                     style,
@@ -1027,6 +1089,8 @@ fn split_bezier_curve_into_pages(
             page_index: page,
             points: current_points,
             preserve_vertices,
+            path_commands: Vec::new(),
+            fill_path: false,
             width,
             rgba,
             style,

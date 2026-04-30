@@ -3,6 +3,7 @@ use super::{note, render};
 use crate::Result;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -81,20 +82,30 @@ fn mirror_folder(input: &Path, output: &Path, format: OutputFormat) -> Result<()
     }
 
     let mut count = 0usize;
+    let total = files.len();
+    println!("Found {total} file(s).");
     for source in files {
+        let index = count + 1;
         let target = output_path_for_source(input, output, &source, format)?;
+        let relative = source.strip_prefix(input)?;
         if source
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("note"))
         {
+            print!("[{index}/{total}] Converting {} ... ", relative.display());
+            io::stdout().flush()?;
             let document = note::load_note_document(&source)?;
             render::write_note_output(&document, &source, &target, format)?;
+            println!("done");
         } else {
+            print!("[{index}/{total}] Copying {} ... ", relative.display());
+            io::stdout().flush()?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::copy(&source, &target)?;
+            println!("done");
         }
         count += 1;
     }
