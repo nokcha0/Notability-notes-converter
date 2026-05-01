@@ -14,7 +14,7 @@ Note: output is not perfectly identical to Notability’s official export. Some 
 
 ## How to use
 
-Requirement: Rust
+Requirement: [Rust](https://rust-lang.org/tools/install/)
 
 Put your exported `.note` files in `input/`, then run this from the repository root:
 
