@@ -75,6 +75,19 @@ pub(crate) struct MediaImage {
     pub(crate) crop: Option<ImageCrop>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct StickyNote {
+    pub(crate) page_index: usize,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+    pub(crate) rotation_degrees: f32,
+    pub(crate) color: [u8; 4],
+    pub(crate) line_style: Option<String>,
+    pub(crate) z_index: i64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ImageCrop {
     pub(crate) x: f32,
@@ -117,6 +130,7 @@ pub(crate) struct NoteDocument {
     pub(crate) text_spans: Vec<TextSpan>,
     pub(crate) text_blocks: Vec<TextBlock>,
     pub(crate) media_images: Vec<MediaImage>,
+    pub(crate) sticky_notes: Vec<StickyNote>,
     pub(crate) pdf_pages: Vec<EmbeddedPdfPage>,
     pub(crate) curves: Vec<StrokeCurve>,
 }

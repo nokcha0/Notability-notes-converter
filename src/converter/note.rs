@@ -1,7 +1,7 @@
 use super::archive::KeyedArchive;
 use super::model::{
-    EmbeddedPdfPage, ImageCrop, MediaImage, NoteDocument, StrokeCurve, TextBlock, TextSpan, TextStyle,
-    DEFAULT_PAGE_RATIO,
+    EmbeddedPdfPage, ImageCrop, MediaImage, NoteDocument, StickyNote, StrokeCurve, TextBlock,
+    TextSpan, TextStyle, DEFAULT_PAGE_RATIO,
 };
 use super::util::{choose_export_width, parse_pair, parse_rect, value_f32, value_i64};
 use crate::pdf::{page_box, page_id_by_index};
@@ -65,6 +65,7 @@ pub(crate) fn load_note_document(note_path: &Path) -> Result<NoteDocument> {
     let (text, text_spans) = parse_text(&archive, rich_text);
     let text_blocks = parse_text_blocks(&archive, rich_text, page_height_doc);
     let media_images = parse_media_images(&archive, rich_text, page_height_doc);
+    let sticky_notes = parse_sticky_notes(&archive, rich_text, page_height_doc);
     let curves = parse_curves(&archive, rich_text, page_height_doc);
     Ok(NoteDocument {
         bundle_root,
@@ -77,6 +78,7 @@ pub(crate) fn load_note_document(note_path: &Path) -> Result<NoteDocument> {
         text_spans,
         text_blocks,
         media_images,
+        sticky_notes,
         pdf_pages,
         curves,
     })
@@ -429,6 +431,69 @@ fn parse_media_images(
     images
 }
 
+fn parse_sticky_notes(
+    archive: &KeyedArchive,
+    rich_text: &Dictionary,
+    page_height_doc: f32,
+) -> Vec<StickyNote> {
+    let mut sticky_notes = Vec::new();
+    for raw_media in archive.ns_array(rich_text.get("mediaObjects")) {
+        let Some(media) = raw_media.as_dictionary() else {
+            continue;
+        };
+        let paper_style = media
+            .get("paperStyleObject")
+            .map(|value| archive.deref(value))
+            .and_then(Value::as_dictionary);
+        let paper_attrs = media
+            .get("kCanvasMediaObjectPaperAttributes")
+            .map(|value| archive.deref(value))
+            .and_then(Value::as_dictionary);
+        if paper_style.is_none() && paper_attrs.is_none() {
+            continue;
+        }
+        let Some((x, y)) = media
+            .get("documentOrigin")
+            .and_then(|value| archive.as_text(value).ok())
+            .and_then(|text| parse_pair(&text))
+        else {
+            continue;
+        };
+        let Some((width, height)) = media
+            .get("unscaledContentSize")
+            .and_then(|value| archive.as_text(value).ok())
+            .and_then(|text| parse_pair(&text))
+        else {
+            continue;
+        };
+        let page_index = (y / page_height_doc).floor() as usize;
+        let color = paper_style
+            .and_then(|style| style.get("paperColor"))
+            .map(|value| parse_text_color(archive.deref(value)))
+            .unwrap_or([255, 244, 142, 255]);
+        let line_style = paper_attrs
+            .and_then(|attrs| attrs.get("lineStyle2"))
+            .and_then(|value| archive.as_text(value).ok());
+        sticky_notes.push(StickyNote {
+            page_index,
+            x,
+            y: y - page_index as f32 * page_height_doc,
+            width,
+            height,
+            rotation_degrees: media
+                .get("rotationDegrees")
+                .and_then(value_f32)
+                .map(normalize_rotation_degrees)
+                .unwrap_or(0.0),
+            color,
+            line_style,
+            z_index: media.get("zIndex").and_then(value_i64).unwrap_or(0),
+        });
+    }
+    sticky_notes.sort_by_key(|sticky| (sticky.page_index, sticky.z_index));
+    sticky_notes
+}
+
 fn normalize_rotation_degrees(raw: f32) -> f32 {
     if raw.abs() <= std::f32::consts::TAU + 0.001 {
         raw.to_degrees()
@@ -589,28 +654,34 @@ fn parse_group_curves(
             continue;
         };
         for object in objects {
-            let Some(object_bytes) = object
-                .as_dictionary()
-                .and_then(|entry| entry.get("object"))
-                .and_then(Value::as_data)
-            else {
+            let Some(entry) = object.as_dictionary() else {
                 continue;
             };
-            let Ok(nested_value) = Value::from_reader(Cursor::new(object_bytes)) else {
+            if let Some(object_bytes) = entry.get("object").and_then(Value::as_data) {
+                let Ok(nested_value) = Value::from_reader(Cursor::new(object_bytes)) else {
+                    continue;
+                };
+                let Ok(nested_archive) = KeyedArchive::new(nested_value) else {
+                    continue;
+                };
+                let Some(nested_spatial_hash) = nested_archive.root.as_dictionary() else {
+                    continue;
+                };
+                curves.extend(parse_curves_from_spatial_hash(
+                    Some(&nested_archive),
+                    nested_spatial_hash,
+                    page_height_doc,
+                    transform,
+                ));
                 continue;
-            };
-            let Ok(nested_archive) = KeyedArchive::new(nested_value) else {
-                continue;
-            };
-            let Some(nested_spatial_hash) = nested_archive.root.as_dictionary() else {
-                continue;
-            };
-            curves.extend(parse_curves_from_spatial_hash(
-                Some(&nested_archive),
-                nested_spatial_hash,
-                page_height_doc,
-                transform,
-            ));
+            }
+            if let Some(shape_root) = entry.get("object").and_then(Value::as_dictionary) {
+                curves.extend(parse_shape_curves_from_root(
+                    shape_root,
+                    page_height_doc,
+                    transform,
+                ));
+            }
         }
     }
     curves
@@ -664,6 +735,14 @@ fn parse_shape_curves(
     let Some(root) = value.as_dictionary() else {
         return Vec::new();
     };
+    parse_shape_curves_from_root(root, page_height_doc, None)
+}
+
+fn parse_shape_curves_from_root(
+    root: &Dictionary,
+    page_height_doc: f32,
+    transform: Option<[f32; 6]>,
+) -> Vec<StrokeCurve> {
     let Some(shapes) = root.get("shapes").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -682,7 +761,8 @@ fn parse_shape_curves(
         let stroke_width = appearance
             .and_then(|appearance| appearance.get("strokeWidth"))
             .and_then(value_f32)
-            .unwrap_or(1.0);
+            .unwrap_or(1.0)
+            * transform_stroke_scale(transform);
         let rgba = appearance
             .and_then(|appearance| appearance.get("strokeColor"))
             .and_then(Value::as_dictionary)
@@ -693,6 +773,12 @@ fn parse_shape_curves(
             .and_then(|appearance| appearance.get("style"))
             .and_then(value_i64)
             .unwrap_or(3) as u8;
+        let dash_pattern = appearance
+            .and_then(|appearance| appearance.get("dashStyle"))
+            .and_then(Value::as_dictionary)
+            .and_then(|dash| dash.get("pattern"))
+            .and_then(value_i64)
+            .map(|pattern| pattern as u8);
         if kind == "partialshape" {
             let Some((path_commands, points)) = shape
                 .get("strokePath")
@@ -701,6 +787,10 @@ fn parse_shape_curves(
             else {
                 continue;
             };
+            let points: Vec<(f32, f32)> = points
+                .into_iter()
+                .map(|point| apply_transform(point, transform))
+                .collect();
             let page_index = points
                 .first()
                 .map(|point| (point.1 / page_height_doc).floor() as usize)
@@ -718,7 +808,7 @@ fn parse_shape_curves(
                 width: stroke_width,
                 rgba,
                 style,
-                dash_pattern: None,
+                dash_pattern,
                 pressures: Vec::new(),
                 fractional_widths: Vec::new(),
             });
@@ -728,20 +818,27 @@ fn parse_shape_curves(
             let Some((x, y, width, height)) = shape.get("rect").and_then(parse_nested_rect) else {
                 continue;
             };
-            let points = vec![(x, y + height / 2.0), (x + width, y + height / 2.0)];
+            let points = vec![(x, y + height / 2.0), (x + width, y + height / 2.0)]
+                .into_iter()
+                .map(|point| apply_transform(point, transform))
+                .collect();
             curves.extend(split_curve_into_pages(
                 points,
                 false,
                 stroke_width,
                 rgba,
                 style,
-                None,
+                dash_pattern,
                 vec![1.0, 1.0],
                 vec![1.0, 1.0],
                 page_height_doc,
             ));
             continue;
         };
+        let points: Vec<(f32, f32)> = points
+            .into_iter()
+            .map(|point| apply_transform(point, transform))
+            .collect();
         let sample_count = bezier_sample_count(points.len());
         curves.extend(split_curve_into_pages(
             points,
@@ -749,7 +846,7 @@ fn parse_shape_curves(
             stroke_width,
             rgba,
             style,
-            None,
+            dash_pattern,
             vec![1.0; sample_count],
             vec![1.0; sample_count],
             page_height_doc,
@@ -760,11 +857,12 @@ fn parse_shape_curves(
 
 fn parse_shape_points(kind: &str, shape: &Dictionary) -> Option<(Vec<(f32, f32)>, bool)> {
     match kind {
-        "square" | "triangle" | "polygon" => {
+        "square" | "rectangle" | "triangle" | "polygon" => {
             let mut points = shape
                 .get("points")
                 .and_then(parse_nested_points)
-                .or_else(|| shape.get("rotatedRect").and_then(parse_rotated_rect_points))?;
+                .or_else(|| shape.get("rotatedRect").and_then(parse_rotated_rect_points))
+                .or_else(|| shape.get("rect").and_then(parse_rect_points))?;
             close_shape_points(&mut points, shape.get("isClosed"));
             Some((points, true))
         }
@@ -772,7 +870,7 @@ fn parse_shape_points(kind: &str, shape: &Dictionary) -> Option<(Vec<(f32, f32)>
             let (center, radius_x, radius_y) = circle_geometry(shape)?;
             Some((ellipse_bezier_points(center, radius_x, radius_y), false))
         }
-        "line" => Some((parse_shape_line_points(shape)?, true)),
+        "line" => parse_shape_line_points(shape),
         _ => None,
     }
 }
@@ -803,11 +901,28 @@ fn parse_notability_path(data: &[u8]) -> Option<(Vec<u8>, Vec<(f32, f32)>)> {
     Some((commands, points))
 }
 
-fn parse_shape_line_points(shape: &Dictionary) -> Option<Vec<(f32, f32)>> {
-    Some(vec![
-        shape.get("startPt").and_then(parse_value_pair)?,
-        shape.get("endPt").and_then(parse_value_pair)?,
-    ])
+fn parse_shape_line_points(shape: &Dictionary) -> Option<(Vec<(f32, f32)>, bool)> {
+    let start = shape.get("startPt").and_then(parse_value_pair)?;
+    let end = shape.get("endPt").and_then(parse_value_pair)?;
+    if let Some(control2) = shape.get("controlPoint2").and_then(parse_value_pair) {
+        let control1 = shape
+            .get("controlPoint1")
+            .and_then(parse_value_pair)
+            .unwrap_or(control2);
+        return Some((vec![start, control1, control2, end], false));
+    }
+    if let Some(control) = shape.get("controlPoint1").and_then(parse_value_pair) {
+        let c1 = (
+            start.0 + (control.0 - start.0) * (2.0 / 3.0),
+            start.1 + (control.1 - start.1) * (2.0 / 3.0),
+        );
+        let c2 = (
+            end.0 + (control.0 - end.0) * (2.0 / 3.0),
+            end.1 + (control.1 - end.1) * (2.0 / 3.0),
+        );
+        return Some((vec![start, c1, c2, end], false));
+    }
+    Some((vec![start, end], true))
 }
 
 fn parse_nested_points(value: &Value) -> Option<Vec<(f32, f32)>> {
@@ -827,6 +942,16 @@ fn parse_rotated_rect_points(value: &Value) -> Option<Vec<(f32, f32)>> {
         .get("corners")
         .and_then(parse_nested_points)?;
     Some(corners)
+}
+
+fn parse_rect_points(value: &Value) -> Option<Vec<(f32, f32)>> {
+    let (x, y, width, height) = parse_nested_rect(value)?;
+    Some(vec![
+        (x, y),
+        (x + width, y),
+        (x + width, y + height),
+        (x, y + height),
+    ])
 }
 
 fn close_shape_points(points: &mut Vec<(f32, f32)>, is_closed: Option<&Value>) {

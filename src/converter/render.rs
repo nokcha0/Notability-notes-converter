@@ -1,7 +1,7 @@
 use super::model::{
-    NoteDocument, OutputFormat, StrokeCurve, TextStyle, DEFAULT_CONTENT_INSET_RATIO,
-    DEFAULT_TEXT_TOP_DOC, STROKE_STYLE_HIGHLIGHTER, STROKE_STYLE_NOT_EXPORTED,
-    STROKE_STYLE_PENCIL, CURVE_SMOOTHING_TENSION,
+    MediaImage, NoteDocument, OutputFormat, StickyNote, StrokeCurve, TextStyle,
+    CURVE_SMOOTHING_TENSION, DEFAULT_CONTENT_INSET_RATIO, DEFAULT_TEXT_TOP_DOC,
+    STROKE_STYLE_HIGHLIGHTER, STROKE_STYLE_NOT_EXPORTED, STROKE_STYLE_PENCIL,
 };
 use super::note::read_zip_entry;
 use super::util::{page_count_for, parse_line_spacing_doc};
@@ -122,6 +122,11 @@ struct ImageCacheKey {
 
 type ImageXObjectCache = BTreeMap<ImageCacheKey, ObjectId>;
 
+enum PageMedia<'a> {
+    Image(&'a MediaImage),
+    Sticky(&'a StickyNote),
+}
+
 impl PdfFonts {
     fn resources(&self) -> [(&'static str, ObjectId); 12] {
         [
@@ -239,75 +244,50 @@ fn write_page(
         content_inset_doc,
         line_spacing_doc,
     );
+    let mut media_layers = Vec::new();
     for (image_index, media) in note
         .media_images
         .iter()
         .filter(|media| media.page_index == page_index)
         .enumerate()
     {
-        let name = format!("Im{image_index}");
-        let image_id = add_image_xobject(output, bundle, note, media, image_cache)?;
-        xobjects.set(name.clone(), image_id);
-        let x = (content_inset_doc + media.x) * doc_to_pt;
-        let y = media.y * doc_to_pt;
-        let width = media.width * doc_to_pt;
-        let height = media.height * doc_to_pt;
-        let draw_y = note.export_height_pt - y - height;
-        let center_x = x + width * 0.5;
-        let center_y = draw_y + height * 0.5;
-        let angle = -media.rotation_degrees.to_radians();
-        let cos = angle.cos();
-        let sin = angle.sin();
-        let image_scale_x = if media.flipped_horizontal { -width } else { width };
-        let image_scale_y = if media.flipped_vertical { -height } else { height };
-        let image_offset_x = if media.flipped_horizontal {
-            width * 0.5
-        } else {
-            -width * 0.5
-        };
-        let image_offset_y = if media.flipped_vertical {
-            height * 0.5
-        } else {
-            -height * 0.5
-        };
-        operations.extend([
-            Operation::new("q", vec![]),
-            Operation::new(
-                "cm",
-                vec![
-                    1.into(),
-                    0.into(),
-                    0.into(),
-                    1.into(),
-                    center_x.into(),
-                    center_y.into(),
-                ],
+        media_layers.push((media.z_index, image_index, PageMedia::Image(media)));
+    }
+    for (sticky_index, sticky) in note
+        .sticky_notes
+        .iter()
+        .filter(|sticky| sticky.page_index == page_index)
+        .enumerate()
+    {
+        media_layers.push((
+            sticky.z_index,
+            note.media_images.len() + sticky_index,
+            PageMedia::Sticky(sticky),
+        ));
+    }
+    media_layers.sort_by_key(|(z_index, order, _)| (*z_index, *order));
+    for (layer_index, (_, _, layer)) in media_layers.into_iter().enumerate() {
+        match layer {
+            PageMedia::Image(media) => draw_pdf_image(
+                &mut operations,
+                &mut xobjects,
+                output,
+                bundle,
+                note,
+                media,
+                image_cache,
+                layer_index,
+                doc_to_pt,
+                content_inset_doc,
+            )?,
+            PageMedia::Sticky(sticky) => draw_pdf_sticky_note(
+                &mut operations,
+                sticky,
+                doc_to_pt,
+                content_inset_doc,
+                note.export_height_pt,
             ),
-            Operation::new(
-                "cm",
-                vec![
-                    cos.into(),
-                    sin.into(),
-                    (-sin).into(),
-                    cos.into(),
-                    0.into(),
-                    0.into(),
-                ],
-            ),
-            Operation::new(
-                "cm",
-                vec![
-                    image_scale_x.into(),
-                    0.into(),
-                    0.into(),
-                    image_scale_y.into(),
-                    image_offset_x.into(),
-                    image_offset_y.into(),
-                ],
-            ),
-            Operation::new("Do", vec![name.into()]),
-            Operation::new("Q", vec![]),
-        ]);
+        }
     }
     let curves: Vec<&StrokeCurve> = note
         .curves
@@ -351,6 +331,154 @@ fn write_page(
         "MediaBox" => vec![0.into(), 0.into(), note.export_width_pt.into(), note.export_height_pt.into()],
     });
     Ok(page_id)
+}
+
+fn draw_pdf_image(
+    operations: &mut Vec<Operation>,
+    xobjects: &mut Dictionary,
+    output: &mut Document,
+    bundle: &mut ZipArchive<File>,
+    note: &NoteDocument,
+    media: &MediaImage,
+    image_cache: &mut ImageXObjectCache,
+    image_index: usize,
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+) -> Result<()> {
+    let name = format!("Im{image_index}");
+    let image_id = add_image_xobject(output, bundle, note, media, image_cache)?;
+    xobjects.set(name.clone(), image_id);
+    let x = (content_inset_doc + media.x) * doc_to_pt;
+    let y = media.y * doc_to_pt;
+    let width = media.width * doc_to_pt;
+    let height = media.height * doc_to_pt;
+    let draw_y = note.export_height_pt - y - height;
+    let center_x = x + width * 0.5;
+    let center_y = draw_y + height * 0.5;
+    let angle = -media.rotation_degrees.to_radians();
+    let cos = angle.cos();
+    let sin = angle.sin();
+    let image_scale_x = if media.flipped_horizontal { -width } else { width };
+    let image_scale_y = if media.flipped_vertical { -height } else { height };
+    let image_offset_x = if media.flipped_horizontal {
+        width * 0.5
+    } else {
+        -width * 0.5
+    };
+    let image_offset_y = if media.flipped_vertical {
+        height * 0.5
+    } else {
+        -height * 0.5
+    };
+    operations.extend([
+        Operation::new("q", vec![]),
+        Operation::new(
+            "cm",
+            vec![1.into(), 0.into(), 0.into(), 1.into(), center_x.into(), center_y.into()],
+        ),
+        Operation::new(
+            "cm",
+            vec![cos.into(), sin.into(), (-sin).into(), cos.into(), 0.into(), 0.into()],
+        ),
+        Operation::new(
+            "cm",
+            vec![
+                image_scale_x.into(),
+                0.into(),
+                0.into(),
+                image_scale_y.into(),
+                image_offset_x.into(),
+                image_offset_y.into(),
+            ],
+        ),
+        Operation::new("Do", vec![name.into()]),
+        Operation::new("Q", vec![]),
+    ]);
+    Ok(())
+}
+
+fn draw_pdf_sticky_note(
+    operations: &mut Vec<Operation>,
+    sticky: &StickyNote,
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+    export_height_pt: f32,
+) {
+    let x = (content_inset_doc + sticky.x) * doc_to_pt;
+    let y = sticky.y * doc_to_pt;
+    let width = sticky.width * doc_to_pt;
+    let height = sticky.height * doc_to_pt;
+    let draw_y = export_height_pt - y - height;
+    let center_x = x + width * 0.5;
+    let center_y = draw_y + height * 0.5;
+    let angle = -sticky.rotation_degrees.to_radians();
+    let cos = angle.cos();
+    let sin = angle.sin();
+    operations.extend([
+        Operation::new("q", vec![]),
+        Operation::new(
+            "cm",
+            vec![1.into(), 0.into(), 0.into(), 1.into(), center_x.into(), center_y.into()],
+        ),
+        Operation::new(
+            "cm",
+            vec![cos.into(), sin.into(), (-sin).into(), cos.into(), 0.into(), 0.into()],
+        ),
+        Operation::new(
+            "rg",
+            vec![
+                (sticky.color[0] as f32 / 255.0).into(),
+                (sticky.color[1] as f32 / 255.0).into(),
+                (sticky.color[2] as f32 / 255.0).into(),
+            ],
+        ),
+        Operation::new(
+            "re",
+            vec![
+                (-width * 0.5).into(),
+                (-height * 0.5).into(),
+                width.into(),
+                height.into(),
+            ],
+        ),
+        Operation::new("f", vec![]),
+    ]);
+    if sticky
+        .line_style
+        .as_deref()
+        .unwrap_or("")
+        .starts_with("Lines")
+    {
+        let spacing_pt = sticky
+            .line_style
+            .as_deref()
+            .and_then(|style| style.split(':').next_back())
+            .and_then(|value| value.parse::<f32>().ok())
+            .map(|inches| inches * 72.0)
+            .unwrap_or(14.0);
+        operations.extend([
+            Operation::new(
+                "RG",
+                vec![
+                    (205.0 / 255.0).into(),
+                    (190.0 / 255.0).into(),
+                    (95.0 / 255.0).into(),
+                ],
+            ),
+            Operation::new("w", vec![0.35.into()]),
+        ]);
+        let mut line_y = spacing_pt * 1.5;
+        while line_y < height - spacing_pt * 0.25 {
+            let py = height * 0.5 - line_y;
+            operations.extend([
+                Operation::new("m", vec![(-width * 0.5).into(), py.into()]),
+                Operation::new("l", vec![(width * 0.5).into(), py.into()]),
+                Operation::new("S", vec![]),
+            ]);
+            line_y += spacing_pt;
+        }
+    }
+    operations.push(Operation::new("Q", vec![]));
 }
 
 fn draw_background(
@@ -913,6 +1041,8 @@ fn add_image_xobject(
     }
     let image = load_media_image(&data, media)?;
     let (width, height) = image.dimensions();
+    let rgba = image.to_rgba8();
+    let has_alpha = rgba.pixels().any(|pixel| pixel.0[3] < 255);
     let rgb = image.to_rgb8();
     let mut content = Vec::new();
     let filter = if is_jpeg {
@@ -925,18 +1055,34 @@ fn add_image_xobject(
         content = encoder.finish()?;
         "FlateDecode"
     };
-    let image_id = output.add_object(Stream::new(
-        dictionary! {
-            "Type" => "XObject",
-            "Subtype" => "Image",
-            "Width" => width as i64,
-            "Height" => height as i64,
-            "ColorSpace" => "DeviceRGB",
-            "BitsPerComponent" => 8,
-            "Filter" => filter,
-        },
-        content,
-    ));
+    let mut image_dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Image",
+        "Width" => width as i64,
+        "Height" => height as i64,
+        "ColorSpace" => "DeviceRGB",
+        "BitsPerComponent" => 8,
+        "Filter" => filter,
+    };
+    if has_alpha {
+        let alpha: Vec<u8> = rgba.pixels().map(|pixel| pixel.0[3]).collect();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&alpha)?;
+        let mask_id = output.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => width as i64,
+                "Height" => height as i64,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8,
+                "Filter" => "FlateDecode",
+            },
+            encoder.finish()?,
+        ));
+        image_dict.set("SMask", mask_id);
+    }
+    let image_id = output.add_object(Stream::new(image_dict, content));
     image_cache.insert(cache_key, image_id);
     Ok(image_id)
 }
@@ -1080,7 +1226,18 @@ fn draw_curves(
                 curve.style == style
             }
         }) {
-            if curve.style == STROKE_STYLE_PENCIL {
+            if curve.fill_path {
+                draw_pen_curve(
+                    operations,
+                    output,
+                    ext_gstates,
+                    ext_cache,
+                    curve,
+                    doc_to_pt,
+                    content_inset_doc,
+                    page_height,
+                );
+            } else if curve.style == STROKE_STYLE_PENCIL {
                 draw_pencil_curve(
                     operations,
                     output,
@@ -1142,6 +1299,9 @@ fn draw_pen_curve(
     page_height: f32,
 ) {
     if curve.points.is_empty() {
+        return;
+    }
+    if is_spurious_dot(curve) {
         return;
     }
     if curve.fill_path {
@@ -1252,7 +1412,7 @@ fn draw_pressure_pen_curve(
                 (pressures[segment_index] + pressures[segment_index + 1]) * 0.5,
                 (fracs[segment_index] + fracs[segment_index + 1]) * 0.5,
             );
-            push_stroke_state(operations, curve, width, &gs);
+            push_pencil_stroke_state(operations, curve, width, &gs);
             let start = points[segment_index * 3];
             let c1 = points[segment_index * 3 + 1];
             let c2 = points[segment_index * 3 + 2];
@@ -1283,7 +1443,7 @@ fn draw_pressure_pen_curve(
                 (pressures[index] + pressures[index + 1]) * 0.5,
                 (fracs[index] + fracs[index + 1]) * 0.5,
             );
-            push_stroke_state(operations, curve, width, &gs);
+            push_pencil_stroke_state(operations, curve, width, &gs);
             operations.extend([
                 Operation::new("m", vec![points[index].0.into(), points[index].1.into()]),
                 Operation::new("l", vec![points[index + 1].0.into(), points[index + 1].1.into()]),
@@ -1316,8 +1476,7 @@ fn draw_pencil_curve(
             let pressure = (pressures[segment_index] + pressures[segment_index + 1]) / 2.0;
             let frac = (fracs[segment_index] + fracs[segment_index + 1]) / 2.0;
             let width = pencil_width(curve.width * doc_to_pt, pressure, frac);
-            let alpha =
-                (curve.rgba[3] as f32 / 255.0) * (0.18 + 0.34 * pressure).clamp(0.14, 0.96);
+            let alpha = pencil_alpha(curve.rgba[3], pressure);
             let gs = ext_gstate_name(output, ext_gstates, ext_cache, alpha, false);
             push_stroke_state(operations, curve, width, &gs);
             let start = points[segment_index * 3];
@@ -1348,8 +1507,7 @@ fn draw_pencil_curve(
             let pressure = (pressures[index] + pressures[index + 1]) / 2.0;
             let frac = (fracs[index] + fracs[index + 1]) / 2.0;
             let width = pencil_width(curve.width * doc_to_pt, pressure, frac);
-            let alpha =
-                (curve.rgba[3] as f32 / 255.0) * (0.18 + 0.34 * pressure).clamp(0.14, 0.96);
+            let alpha = pencil_alpha(curve.rgba[3], pressure);
             let gs = ext_gstate_name(output, ext_gstates, ext_cache, alpha, false);
             push_stroke_state(operations, curve, width, &gs);
             operations.extend([
@@ -1390,6 +1548,29 @@ fn push_stroke_state(
     }
 }
 
+fn push_pencil_stroke_state(
+    operations: &mut Vec<Operation>,
+    curve: &StrokeCurve,
+    width: f32,
+    gs: &str,
+) {
+    operations.extend([
+        Operation::new("q", vec![]),
+        Operation::new("gs", vec![gs.into()]),
+        Operation::new(
+            "RG",
+            vec![
+                (curve.rgba[0] as f32 / 255.0).into(),
+                (curve.rgba[1] as f32 / 255.0).into(),
+                (curve.rgba[2] as f32 / 255.0).into(),
+            ],
+        ),
+        Operation::new("w", vec![width.max(0.1).into()]),
+        Operation::new("J", vec![0.into()]),
+        Operation::new("j", vec![1.into()]),
+    ]);
+}
+
 fn dash_lengths(pattern: u8, style: u8, width: f32) -> (f32, f32) {
     match (pattern, style == STROKE_STYLE_HIGHLIGHTER) {
         (1, true) => ((width * 2.0).max(2.0), (width * 2.1).max(1.8)),
@@ -1413,6 +1594,17 @@ fn curve_path_extent(curve: &StrokeCurve) -> f32 {
         max_y = max_y.max(*y);
     }
     (max_x - min_x).hypot(max_y - min_y)
+}
+
+fn is_spurious_dot(curve: &StrokeCurve) -> bool {
+    let is_dark = curve.rgba[0] < 48 && curve.rgba[1] < 48 && curve.rgba[2] < 48;
+    is_dark
+        && curve.style != STROKE_STYLE_HIGHLIGHTER
+        && curve.width <= 0.75
+        && curve.dash_pattern.is_none()
+        && (curve.points.len() == 1
+            || curve_path_extent(curve) <= curve.width * 2.5
+            || (curve.fill_path && curve_path_extent(curve) <= 25.0))
 }
 
 fn draw_path(operations: &mut Vec<Operation>, curve: &StrokeCurve, points: &[(f32, f32)]) {
@@ -1617,7 +1809,12 @@ fn stroke_points_pt(
 fn pencil_width(base_width: f32, pressure: f32, frac: f32) -> f32 {
     let pressure = pressure.clamp(0.05, 2.5);
     let frac = frac.clamp(0.15, 3.0);
-    (base_width * frac * (0.45 + 0.38 * pressure.sqrt())).max(0.1)
+    (base_width * frac * (0.38 + 0.30 * pressure.sqrt())).max(0.1)
+}
+
+fn pencil_alpha(raw_alpha: u8, pressure: f32) -> f32 {
+    let pressure = pressure.clamp(0.05, 2.5);
+    (raw_alpha as f32 / 255.0) * (0.08 + 0.18 * pressure).clamp(0.08, 0.55)
 }
 
 fn pen_width(base_width: f32, pressure: f32, frac: f32) -> f32 {
@@ -2028,11 +2225,49 @@ fn draw_svg_images(
     doc_to_pt: f32,
     content_inset_doc: f32,
 ) -> Result<()> {
-    for media in note
+    let mut media_layers = Vec::new();
+    for (image_index, media) in note
         .media_images
         .iter()
         .filter(|media| media.page_index == page_index)
+        .enumerate()
     {
+        media_layers.push((media.z_index, image_index, PageMedia::Image(media)));
+    }
+    for (sticky_index, sticky) in note
+        .sticky_notes
+        .iter()
+        .filter(|sticky| sticky.page_index == page_index)
+        .enumerate()
+    {
+        media_layers.push((
+            sticky.z_index,
+            note.media_images.len() + sticky_index,
+            PageMedia::Sticky(sticky),
+        ));
+    }
+    media_layers.sort_by_key(|(z_index, order, _)| (*z_index, *order));
+    for (_, _, layer) in media_layers {
+        match layer {
+            PageMedia::Image(media) => {
+                draw_svg_image(svg, bundle, note, media, doc_to_pt, content_inset_doc)?
+            }
+            PageMedia::Sticky(sticky) => {
+                draw_svg_sticky_note(svg, sticky, doc_to_pt, content_inset_doc)?
+            }
+        }
+    }
+    Ok(())
+}
+
+fn draw_svg_image(
+    svg: &mut String,
+    bundle: &mut ZipArchive<File>,
+    note: &NoteDocument,
+    media: &MediaImage,
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+) -> Result<()> {
         let path = note.bundle_root.clone() + &media.relative_path;
         let data = read_zip_entry(bundle, &path)?;
         let (mime_type, encoded_data) = if media.crop.is_some() {
@@ -2082,7 +2317,67 @@ fn draw_svg_images(
             base64_encode(&encoded_data),
             transform
         )?;
+    Ok(())
+}
+
+fn draw_svg_sticky_note(
+    svg: &mut String,
+    sticky: &StickyNote,
+    doc_to_pt: f32,
+    content_inset_doc: f32,
+) -> Result<()> {
+    let x = (content_inset_doc + sticky.x) * doc_to_pt;
+    let y = sticky.y * doc_to_pt;
+    let width = sticky.width * doc_to_pt;
+    let height = sticky.height * doc_to_pt;
+    let center_x = x + width * 0.5;
+    let center_y = y + height * 0.5;
+    let transform = if sticky.rotation_degrees.abs() > f32::EPSILON {
+        format!(
+            " transform=\"rotate({:.4} {:.2} {:.2})\"",
+            sticky.rotation_degrees, center_x, center_y
+        )
+    } else {
+        String::new()
+    };
+    write!(
+        svg,
+        "<g{}><rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"{}\" fill-opacity=\"{:.3}\"/>",
+        transform,
+        x,
+        y,
+        width,
+        height,
+        svg_rgb(sticky.color),
+        sticky.color[3] as f32 / 255.0
+    )?;
+    if sticky
+        .line_style
+        .as_deref()
+        .unwrap_or("")
+        .starts_with("Lines")
+    {
+        let spacing = sticky
+            .line_style
+            .as_deref()
+            .and_then(|style| style.split(':').next_back())
+            .and_then(|value| value.parse::<f32>().ok())
+            .map(|inches| inches * 72.0)
+            .unwrap_or(14.0);
+        let mut line_y = spacing * 1.5;
+        while line_y < height - spacing * 0.25 {
+            write!(
+                svg,
+                "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"#cdbe5f\" stroke-width=\"0.35\"/>",
+                x,
+                y + line_y,
+                x + width,
+                y + line_y
+            )?;
+            line_y += spacing;
+        }
     }
+    svg.push_str("</g>");
     Ok(())
 }
 
@@ -2109,7 +2404,9 @@ fn draw_svg_curves(
                 curve.style == style
             }
         }) {
-            if curve.style == STROKE_STYLE_PENCIL {
+            if curve.fill_path {
+                draw_svg_pen_curve(svg, curve, doc_to_pt, content_inset_doc, page_height)?;
+            } else if curve.style == STROKE_STYLE_PENCIL {
                 draw_svg_pencil_curve(svg, curve, doc_to_pt, content_inset_doc)?;
             } else {
                 draw_svg_pen_curve(svg, curve, doc_to_pt, content_inset_doc, page_height)?;
@@ -2127,6 +2424,9 @@ fn draw_svg_pen_curve(
     page_height: f32,
 ) -> Result<()> {
     if curve.points.is_empty() {
+        return Ok(());
+    }
+    if is_spurious_dot(curve) {
         return Ok(());
     }
     if curve.style == STROKE_STYLE_HIGHLIGHTER
@@ -2199,8 +2499,7 @@ fn draw_svg_pencil_curve(
             let pressure = (pressures[segment_index] + pressures[segment_index + 1]) / 2.0;
             let frac = (fracs[segment_index] + fracs[segment_index + 1]) / 2.0;
             let width = pencil_width(curve.width * doc_to_pt, pressure, frac);
-            let alpha =
-                (curve.rgba[3] as f32 / 255.0) * (0.18 + 0.34 * pressure).clamp(0.14, 0.96);
+            let alpha = pencil_alpha(curve.rgba[3], pressure);
             let start = points[segment_index * 3];
             let c1 = points[segment_index * 3 + 1];
             let c2 = points[segment_index * 3 + 2];
@@ -2210,7 +2509,7 @@ fn draw_svg_pencil_curve(
                 concat!(
                     "<path d=\"M {:.2} {:.2} C {:.2} {:.2} {:.2} {:.2} {:.2} {:.2}\" ",
                     "fill=\"none\" stroke=\"{}\" stroke-opacity=\"{:.3}\" stroke-width=\"{:.2}\" ",
-                    "stroke-linecap=\"round\" stroke-linejoin=\"round\" />"
+                    "stroke-linecap=\"butt\" stroke-linejoin=\"round\" />"
                 ),
                 start.0,
                 start.1,
@@ -2232,13 +2531,12 @@ fn draw_svg_pencil_curve(
             let pressure = (pressures[index] + pressures[index + 1]) / 2.0;
             let frac = (fracs[index] + fracs[index + 1]) / 2.0;
             let width = pencil_width(curve.width * doc_to_pt, pressure, frac);
-            let alpha =
-                (curve.rgba[3] as f32 / 255.0) * (0.18 + 0.34 * pressure).clamp(0.14, 0.96);
+            let alpha = pencil_alpha(curve.rgba[3], pressure);
             write!(
                 svg,
                 concat!(
                     "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" ",
-                    "stroke-opacity=\"{:.3}\" stroke-width=\"{:.2}\" stroke-linecap=\"round\" />"
+                    "stroke-opacity=\"{:.3}\" stroke-width=\"{:.2}\" stroke-linecap=\"butt\" />"
                 ),
                 points[index].0,
                 points[index].1,

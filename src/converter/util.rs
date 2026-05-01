@@ -85,6 +85,9 @@ pub(crate) fn page_count_for(note: &NoteDocument) -> usize {
     if let Some(max_page) = note.media_images.iter().map(|media| media.page_index).max() {
         page_count = page_count.max(max_page + 1);
     }
+    if let Some(max_page) = note.sticky_notes.iter().map(|sticky| sticky.page_index).max() {
+        page_count = page_count.max(max_page + 1);
+    }
     if let Some(max_page) = note.text_blocks.iter().map(|block| block.page_index).max() {
         page_count = page_count.max(max_page + 1);
     }

@@ -131,7 +131,8 @@ Shape strokes are separate from normal raw curves:
 
 - `square`, `triangle`, and `polygon` use explicit point lists
 - `circle` uses `rotatedRect` or `rect`
-- `line` uses `startPt` and `endPt`; do not derive it from `rect`, or angled lines become horizontal
+- `line` uses `startPt` and `endPt`; curved lines also use `controlPoint1` / `controlPoint2`
+- dashed/dotted shapes use `appearance -> dashStyle -> pattern`
 - `partialshape` represents partially erased shape/line fragments; use its `strokePath` outline as a filled path to preserve the erased gap size
 
 Layering is reconstructed from page backgrounds first, then text, text blocks, images, and handwriting according to the parsed order and z-order where available.
