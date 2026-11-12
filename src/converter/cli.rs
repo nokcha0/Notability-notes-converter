@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 #[cfg(test)]
@@ -73,11 +74,15 @@ fn usage_error() -> Box<dyn std::error::Error> {
 fn mirror_folder(input: &Path, output: &Path, format: OutputFormat) -> Result<()> {
     let input = input.canonicalize()?;
     let output = validate_output_dir(&input, output)?;
+    let backups = validate_output_dir(&input, &backup_root(&output)?)?;
+    if backups.starts_with(&output) || output.starts_with(&backups) {
+        return Err("Backup folder must be separate from the output folder".into());
+    }
     let files = source_files(&input)?;
     validate_collisions(&input, &output, &files, format)?;
     let mut staging = OwnedDirectory::beside(&output, "staging")?;
     let count = mirror_into(&input, &staging.path, files, format)?;
-    let backup = publish_output(&mut staging, &output)?;
+    let backup = publish_output(&mut staging, &output, &backups)?;
     println!("Mirrored {count} file(s) to {}", output.display());
     if let Some(backup) = backup {
         println!("Previous output kept at {}", backup.display());
@@ -191,6 +196,15 @@ struct OwnedDirectory {
     cleanup: bool,
 }
 
+fn backup_root(output: &Path) -> Result<PathBuf> {
+    let mut name = output
+        .file_name()
+        .ok_or("Output folder has no name")?
+        .to_os_string();
+    name.push(".backups");
+    Ok(output.with_file_name(name))
+}
+
 impl OwnedDirectory {
     fn beside(output: &Path, label: &str) -> Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -218,6 +232,32 @@ impl OwnedDirectory {
             }
         }
     }
+
+    fn backup_in(root: &Path) -> Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        fs::create_dir_all(root)?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        loop {
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = root.join(format!(
+                "backup-{timestamp}-{}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        cleanup: true,
+                    })
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
 }
 
 impl Drop for OwnedDirectory {
@@ -229,28 +269,32 @@ impl Drop for OwnedDirectory {
     }
 }
 
-fn publish_output(staging: &mut OwnedDirectory, output: &Path) -> Result<Option<PathBuf>> {
+fn publish_output(
+    staging: &mut OwnedDirectory,
+    output: &Path,
+    backups: &Path,
+) -> Result<Option<PathBuf>> {
     let backup = if output.exists() {
-        let mut directory = OwnedDirectory::beside(output, "backup")?;
-        let previous = directory.path.join("previous");
-        fs::rename(output, &previous)?;
-        // Once it holds previous output, never automatically delete the backup.
+        let mut directory = OwnedDirectory::backup_in(backups)?;
+        // Reserve a unique name, then move the entire output into that snapshot.
+        // Removing this newly created empty directory supports Windows renames.
+        fs::remove_dir(&directory.path)?;
         directory.cleanup = false;
-        Some((directory.path.clone(), previous))
+        fs::rename(output, &directory.path)?;
+        Some(directory.path.clone())
     } else {
         None
     };
     if let Err(error) = fs::rename(&staging.path, output) {
-        if let Some((directory, previous)) = &backup {
+        if let Some(previous) = &backup {
             if let Err(rollback) = fs::rename(previous, output) {
                 return Err(format!("Could not publish output: {error}. Could not restore previous output: {rollback}. Previous output is at {}", previous.display()).into());
             }
-            let _ = fs::remove_dir(directory);
         }
         return Err(error.into());
     }
     staging.cleanup = false;
-    Ok(backup.map(|(_, previous)| previous))
+    Ok(backup)
 }
 
 fn source_files(input: &Path) -> Result<Vec<PathBuf>> {

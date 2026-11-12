@@ -189,6 +189,54 @@ fn fixture() -> Vec<u8> {
     b.0
 }
 
+fn image_fixture(crop: [f32; 4], logical_size: (f32, f32)) -> Vec<u8> {
+    let mut b = Buffer(vec![0; 4]);
+    let root = b.table(7, &[(6, vec![0; 4])]);
+    let vector = b.0.len();
+    b.0.extend(1u32.to_le_bytes());
+    b.0.extend([0; 4]);
+    b.link(root, 6, vector);
+    b.0[..4].copy_from_slice(&(root as u32).to_le_bytes());
+    let event = b.table(6, &[(0, id(42)), (4, vec![22]), (5, vec![0; 4])]);
+    b.0[vector + 4..vector + 8].copy_from_slice(&((event - vector - 4) as u32).to_le_bytes());
+    let payload = b.table(
+        12,
+        &[
+            (0, vec![1]),
+            (2, position(1, 0)),
+            (3, pair(30.0, 40.0)),
+            (6, pair(100.0, 50.0)),
+            (10, vec![0; 4]),
+            (11, crop.into_iter().flat_map(f32::to_le_bytes).collect()),
+        ],
+    );
+    b.link(event, 5, payload);
+    let media = b.table(
+        2,
+        &[(0, vec![0; 4]), (1, pair(logical_size.0, logical_size.1))],
+    );
+    b.link(payload, 10, media);
+    let asset = b.table(3, &[(0, vec![0; 64]), (2, vec![0; 4])]);
+    b.link(media, 0, asset);
+    let mime = b.string("image/png");
+    b.link(asset, 2, mime);
+    b.0
+}
+
+fn image_asset() -> (String, Vec<u8>) {
+    let image = image::RgbaImage::from_fn(20, 10, |x, y| {
+        image::Rgba([x as u8 * 10, y as u8 * 20, 33, if x == 0 { 0 } else { 255 }])
+    });
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    (
+        format!("assets/{}.png", "00".repeat(64)),
+        bytes.into_inner(),
+    )
+}
+
 struct Bundle {
     directory: PathBuf,
     path: PathBuf,
@@ -279,6 +327,122 @@ fn links_interleaved_text_boxes_and_utf16_styles_by_event_id() {
 }
 
 #[test]
+fn logical_fractional_image_crops_preserve_source_pixels_and_display_size() {
+    let (name, data) = image_asset();
+    let bundle = Bundle::new(
+        &image_fixture([1.25, 0.5, 4.25, 2.5], (10.0, 5.0)),
+        &[(name.as_str(), data)],
+    );
+    let note = load_ntb_document(&bundle.path).unwrap();
+    let image = &note.media_images[0];
+    assert_eq!((image.width, image.height), (100.0, 50.0));
+    assert_eq!(image.crop.unwrap().reference_size, Some((10.0, 5.0)));
+    let output = bundle.directory.join("out.pdf");
+    write_note_output(&note, &bundle.path, &output, OutputFormat::Pdf).unwrap();
+    let pdf = Document::load(output).unwrap();
+    let page = *pdf.get_pages().get(&1).unwrap();
+    let resources = pdf
+        .get_object(page)
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Resources")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let form_id = pdf
+        .get_object(resources)
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"XObject")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Im0")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let form = pdf.get_object(form_id).unwrap().as_stream().unwrap();
+    assert_eq!(
+        form.dict.get(b"Subtype").unwrap().as_name().unwrap(),
+        b"Form"
+    );
+    let ops = Content::decode(&form.content).unwrap().operations;
+    let transform: Vec<_> = ops
+        .iter()
+        .find(|op| op.operator == "cm")
+        .unwrap()
+        .operands
+        .iter()
+        .map(|v| v.as_float().unwrap())
+        .collect();
+    let expected = [20.0 / 8.5, 0.0, 0.0, 2.0, -2.5 / 8.5, -0.8];
+    for (actual, expected) in transform.iter().zip(expected) {
+        assert!((actual - expected).abs() < 0.000001);
+    }
+    let source_id = form
+        .dict
+        .get(b"Resources")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"XObject")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Image")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let source = pdf.get_object(source_id).unwrap().as_stream().unwrap();
+    assert_eq!(source.dict.get(b"Width").unwrap().as_i64().unwrap(), 20);
+    assert_eq!(source.dict.get(b"Height").unwrap().as_i64().unwrap(), 10);
+    assert!(source.dict.get(b"Interpolate").unwrap().as_bool().unwrap());
+    let mask_id = source.dict.get(b"SMask").unwrap().as_reference().unwrap();
+    let mask = pdf.get_object(mask_id).unwrap().as_stream().unwrap();
+    assert!(mask.dict.get(b"Interpolate").unwrap().as_bool().unwrap());
+    let output = bundle.directory.join("out.svg");
+    write_note_output(&note, &bundle.path, &output, OutputFormat::Svg).unwrap();
+    let svg = fs::read_to_string(output).unwrap();
+    assert!(svg.contains("width=\"100.00000\" height=\"50.00000\""));
+    assert!(svg.contains("viewBox=\"0 0 1 1\" preserveAspectRatio=\"none\" overflow=\"hidden\""));
+    let inner = svg.split("<image ").nth(1).unwrap();
+    for (name, expected) in [
+        ("x", -2.5 / 8.5),
+        ("y", -0.2),
+        ("width", 20.0 / 8.5),
+        ("height", 2.0),
+    ] {
+        let value: f32 = inner
+            .split(&format!("{name}=\""))
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((value - expected).abs() < 0.000001);
+    }
+}
+
+#[test]
+fn small_fractional_crops_are_not_mistaken_for_the_whole_asset() {
+    let (name, data) = image_asset();
+    let bundle = Bundle::new(
+        &image_fixture([0.25, 0.0, 9.75, 5.0], (10.0, 5.0)),
+        &[(name.as_str(), data)],
+    );
+    let note = load_ntb_document(&bundle.path).unwrap();
+    let crop = note.media_images[0].crop.unwrap().in_pixels(20, 10);
+    assert_eq!(
+        (crop.x, crop.y, crop.width, crop.height),
+        (0.5, 0.0, 19.5, 10.0)
+    );
+}
+
+#[test]
 fn renders_annotations_on_their_own_pages_and_preserves_blank_pdf_pages() {
     let bundle = Bundle::new(&fixture(), &[("assets/background.pdf", background_pdf(5))]);
     let note = load_ntb_document(&bundle.path).unwrap();
@@ -306,6 +470,35 @@ fn renders_annotations_on_their_own_pages_and_preserves_blank_pdf_pages() {
             _ => assert!(text.is_empty()),
         }
     }
+}
+
+#[test]
+fn browser_svg_loads_each_pdf_asset_once_and_requires_all_backgrounds() {
+    let pdf = background_pdf(5);
+    let bundle = Bundle::new(&fixture(), &[("assets/background.pdf", pdf.clone())]);
+    let converter = crate::Converter::new(fs::read(&bundle.path).unwrap(), "fixture.ntb").unwrap();
+    let backgrounds = converter.pdf_backgrounds().unwrap();
+    assert_eq!(backgrounds.assets, [pdf]);
+    assert_eq!(backgrounds.pages.len(), 5);
+    for (index, page) in backgrounds.pages.iter().enumerate() {
+        assert_eq!(page.asset_index, 0);
+        assert_eq!(page.page_index, index);
+    }
+    assert!(converter.render_svg_with_backgrounds(&[]).is_err());
+    assert!(converter
+        .render_svg_with_backgrounds(&vec![b"not PNG".to_vec(); 5])
+        .is_err());
+    let (_, png) = image_asset();
+    let svg = converter
+        .render_svg_with_backgrounds(&vec![png; 5])
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(svg)
+            .unwrap()
+            .matches("data:image/png;base64,")
+            .count(),
+        5
+    );
 }
 
 #[test]

@@ -9,7 +9,7 @@ use crate::converter::note::read_zip_entry;
 use crate::Result;
 use lopdf::Document;
 use std::collections::BTreeMap;
-use std::fs::File;
+use std::io::{Read, Seek};
 use zip::ZipArchive;
 
 type EventId = [u32; 2];
@@ -225,7 +225,9 @@ pub(super) fn reconstruct_text(
 /// A single imported PDF maps source page numbers directly to note page numbers.
 /// Preserve pages without annotations as well. Multiple assets need explicit page
 /// placement metadata; choosing an arbitrary archive entry would lose content.
-pub(super) fn pdf_backgrounds(bundle: &mut ZipArchive<File>) -> Result<Vec<EmbeddedPdfPage>> {
+pub(super) fn pdf_backgrounds<R: Read + Seek>(
+    bundle: &mut ZipArchive<R>,
+) -> Result<Vec<EmbeddedPdfPage>> {
     let pdfs: Vec<String> = bundle
         .file_names()
         .filter(|name| name.starts_with("assets/") && name.to_ascii_lowercase().ends_with(".pdf"))

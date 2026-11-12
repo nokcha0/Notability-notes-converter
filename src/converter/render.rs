@@ -10,36 +10,48 @@ use crate::Result;
 use flate2::{write::ZlibEncoder, Compression};
 use image::codecs::gif::GifDecoder;
 use image::codecs::jpeg::JpegEncoder;
-use image::{AnimationDecoder, DynamicImage, ExtendedColorType, GenericImageView, ImageFormat};
+use image::{AnimationDecoder, DynamicImage, ExtendedColorType, GenericImageView};
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::{Command, Stdio};
 use zip::ZipArchive;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn write_note_output(
     note: &NoteDocument,
     note_path: &Path,
     output_path: &Path,
     format: OutputFormat,
 ) -> Result<()> {
-    match format {
-        OutputFormat::Pdf => write_lopdf_pdf(note, note_path, output_path),
-        OutputFormat::Svg => write_svg(note, note_path, output_path),
-    }
-}
-
-fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Result<()> {
+    let mut bundle = ZipArchive::new(File::open(note_path)?)?;
+    let bytes = render_note(note, &mut bundle, format)?;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let source_file = File::open(note_path)?;
-    let mut bundle = ZipArchive::new(source_file)?;
+    fs::write(output_path, bytes)?;
+    Ok(())
+}
+
+pub(crate) fn render_note<R: Read + Seek>(
+    note: &NoteDocument,
+    bundle: &mut ZipArchive<R>,
+    format: OutputFormat,
+) -> Result<Vec<u8>> {
+    match format {
+        OutputFormat::Pdf => render_pdf(note, bundle),
+        OutputFormat::Svg => render_svg(note, bundle, None),
+    }
+}
+
+fn render_pdf<R: Read + Seek>(note: &NoteDocument, bundle: &mut ZipArchive<R>) -> Result<Vec<u8>> {
     let mut output = Document::with_version("1.5");
     let mut max_id = 1u32;
     let mut loaded_pdfs: BTreeMap<String, Document> = BTreeMap::new();
@@ -50,7 +62,7 @@ fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) ->
         .map(|page| page.relative_path.clone())
         .collect::<BTreeSet<_>>()
     {
-        let data = read_zip_entry(&mut bundle, &(note.bundle_root.clone() + &relative_path))?;
+        let data = read_zip_entry(bundle, &(note.bundle_root.clone() + &relative_path))?;
         let mut doc = Document::load_mem(&data)?;
         doc.renumber_objects_with(max_id);
         max_id = doc.max_id + 1;
@@ -68,7 +80,7 @@ fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) ->
     for page_index in 0..page_count {
         let page_id = write_page(
             &mut output,
-            &mut bundle,
+            bundle,
             note,
             &loaded_pdfs,
             &fonts,
@@ -95,8 +107,9 @@ fn write_lopdf_pdf(note: &NoteDocument, note_path: &Path, output_path: &Path) ->
         output.prune_objects();
         output.renumber_objects();
     }
-    output.save(output_path)?;
-    Ok(())
+    let mut bytes = Vec::new();
+    output.save_to(&mut bytes)?;
+    Ok(bytes)
 }
 
 struct PdfFonts {
@@ -118,7 +131,7 @@ struct PdfFonts {
 struct ImageCacheKey {
     data_hash: u64,
     data_len: usize,
-    crop: Option<[u32; 4]>,
+    crop: Option<[u32; 6]>,
     is_jpeg: bool,
 }
 
@@ -201,9 +214,9 @@ fn add_standard_fonts(output: &mut Document) -> PdfFonts {
     }
 }
 
-fn write_page(
+fn write_page<R: Read + Seek>(
     output: &mut Document,
-    bundle: &mut ZipArchive<File>,
+    bundle: &mut ZipArchive<R>,
     note: &NoteDocument,
     loaded_pdfs: &BTreeMap<String, Document>,
     fonts: &PdfFonts,
@@ -340,11 +353,11 @@ fn write_page(
     Ok(page_id)
 }
 
-fn draw_pdf_image(
+fn draw_pdf_image<R: Read + Seek>(
     operations: &mut Vec<Operation>,
     xobjects: &mut Dictionary,
     output: &mut Document,
-    bundle: &mut ZipArchive<File>,
+    bundle: &mut ZipArchive<R>,
     note: &NoteDocument,
     media: &MediaImage,
     image_cache: &mut ImageXObjectCache,
@@ -1144,9 +1157,9 @@ fn helvetica_width_factor(ch: char) -> f32 {
     }
 }
 
-fn add_image_xobject(
+fn add_image_xobject<R: Read + Seek>(
     output: &mut Document,
-    bundle: &mut ZipArchive<File>,
+    bundle: &mut ZipArchive<R>,
     note: &NoteDocument,
     media: &super::model::MediaImage,
     image_cache: &mut ImageXObjectCache,
@@ -1161,7 +1174,9 @@ fn add_image_xobject(
     if is_jpeg {
         if let Some((width, height, 3)) = jpeg_dimensions(&data) {
             let image_id = add_direct_jpeg(output, data, width, height);
-            let image_id = if let Some(transform) = jpeg_crop_transform(media.crop, width, height) {
+            let image_id = if let Some(transform) =
+                image_crop_transform(media.crop, width as u32, height as u32)
+            {
                 add_cropped_image_form(output, image_id, transform)?
             } else {
                 image_id
@@ -1194,6 +1209,7 @@ fn add_image_xobject(
         "ColorSpace" => "DeviceRGB",
         "BitsPerComponent" => 8,
         "Filter" => filter,
+        "Interpolate" => true,
     };
     if has_alpha {
         let alpha: Vec<u8> = rgba.pixels().map(|pixel| pixel.0[3]).collect();
@@ -1208,12 +1224,18 @@ fn add_image_xobject(
                 "ColorSpace" => "DeviceGray",
                 "BitsPerComponent" => 8,
                 "Filter" => "FlateDecode",
+                "Interpolate" => true,
             },
             encoder.finish()?,
         ));
         image_dict.set("SMask", mask_id);
     }
     let image_id = output.add_object(Stream::new(image_dict, content));
+    let image_id = if let Some(transform) = image_crop_transform(media.crop, width, height) {
+        add_cropped_image_form(output, image_id, transform)?
+    } else {
+        image_id
+    };
     image_cache.insert(cache_key, image_id);
     Ok(image_id)
 }
@@ -1228,6 +1250,7 @@ fn add_direct_jpeg(output: &mut Document, data: Vec<u8>, width: u16, height: u16
             "ColorSpace" => "DeviceRGB",
             "BitsPerComponent" => 8,
             "Filter" => "DCTDecode",
+            "Interpolate" => true,
         },
         data,
     ))
@@ -1266,12 +1289,12 @@ fn add_cropped_image_form(
     )))
 }
 
-fn jpeg_crop_transform(
+fn image_crop_transform(
     crop: Option<super::model::ImageCrop>,
-    image_width: u16,
-    image_height: u16,
+    image_width: u32,
+    image_height: u32,
 ) -> Option<[f32; 6]> {
-    let crop = crop?;
+    let crop = crop?.in_pixels(image_width, image_height);
     if crop_covers_image(Some(crop), image_width, image_height) {
         return None;
     }
@@ -1306,6 +1329,8 @@ fn image_cache_key(data: &[u8], media: &super::model::MediaImage, is_jpeg: bool)
                 crop.y.to_bits(),
                 crop.width.to_bits(),
                 crop.height.to_bits(),
+                crop.reference_size.map_or(0, |size| size.0.to_bits()),
+                crop.reference_size.map_or(0, |size| size.1.to_bits()),
             ]
         }),
         is_jpeg,
@@ -1323,16 +1348,18 @@ fn is_jpeg_path(path: &str) -> bool {
 
 fn crop_covers_image(
     crop: Option<super::model::ImageCrop>,
-    image_width: u16,
-    image_height: u16,
+    image_width: u32,
+    image_height: u32,
 ) -> bool {
     let Some(crop) = crop else {
         return true;
     };
-    crop.x <= 0.5
-        && crop.y <= 0.5
-        && crop.width + crop.x >= image_width as f32 - 0.5
-        && crop.height + crop.y >= image_height as f32 - 0.5
+    let crop = crop.in_pixels(image_width, image_height);
+    let epsilon = f32::EPSILON * image_width.max(image_height) as f32 * 2.0;
+    crop.x.abs() <= epsilon
+        && crop.y.abs() <= epsilon
+        && (crop.width - image_width as f32).abs() <= epsilon
+        && (crop.height - image_height as f32).abs() <= epsilon
 }
 
 fn jpeg_dimensions(data: &[u8]) -> Option<(u16, u16, u8)> {
@@ -1392,20 +1419,8 @@ fn load_media_image(data: &[u8], media: &super::model::MediaImage) -> Result<Dyn
     } else {
         image::load_from_memory(data)?
     };
-    let Some(crop) = media.crop else {
-        return Ok(image);
-    };
-    let (image_width, image_height) = image.dimensions();
-    let x = crop.x.max(0.0).floor() as u32;
-    let y = crop.y.max(0.0).floor() as u32;
-    if x >= image_width || y >= image_height {
-        return Ok(image);
-    }
-    let width = crop.width.max(1.0).ceil() as u32;
-    let height = crop.height.max(1.0).ceil() as u32;
-    let width = width.min(image_width - x);
-    let height = height.min(image_height - y);
-    Ok(image.crop_imm(x, y, width, height))
+    // Keep source pixels intact. Crops are applied by a fractional clip transform.
+    Ok(image)
 }
 
 fn draw_curves(
@@ -2094,12 +2109,19 @@ fn is_bezier_point_count(point_count: usize) -> bool {
     point_count >= 4 && (point_count - 1) % 3 == 0
 }
 
-fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Result<()> {
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let source_file = File::open(note_path)?;
-    let mut bundle = ZipArchive::new(source_file)?;
+pub(crate) fn render_svg_with_backgrounds<R: Read + Seek>(
+    note: &NoteDocument,
+    bundle: &mut ZipArchive<R>,
+    backgrounds: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    render_svg(note, bundle, Some(backgrounds))
+}
+
+fn render_svg<R: Read + Seek>(
+    note: &NoteDocument,
+    bundle: &mut ZipArchive<R>,
+    backgrounds: Option<&[Vec<u8>]>,
+) -> Result<Vec<u8>> {
     let page_count = page_count_for(note);
     let total_height = note.export_height_pt * page_count as f32;
     let doc_to_pt = note.export_width_pt / note.page_width_doc;
@@ -2112,11 +2134,8 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
     let mut svg = String::new();
     let mut pdf_assets = BTreeMap::new();
     for page in &note.pdf_pages {
-        if !pdf_assets.contains_key(&page.relative_path) {
-            let data = read_zip_entry(
-                &mut bundle,
-                &(note.bundle_root.clone() + &page.relative_path),
-            )?;
+        if backgrounds.is_none() && !pdf_assets.contains_key(&page.relative_path) {
+            let data = read_zip_entry(bundle, &(note.bundle_root.clone() + &page.relative_path))?;
             pdf_assets.insert(page.relative_path.clone(), data);
         }
     }
@@ -2152,18 +2171,29 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
             content_inset_doc,
             line_spacing_doc,
         )?;
-        if let Some(page) = note
+        if let Some((index, page)) = note
             .pdf_pages
             .iter()
-            .find(|page| page.page_index == page_index)
+            .enumerate()
+            .find(|(_, page)| page.page_index == page_index)
         {
-            draw_svg_pdf_background(
-                &mut svg,
-                &pdf_assets[&page.relative_path],
-                page.source_page_index,
-                note.export_width_pt,
-                note.export_height_pt,
-            )?;
+            if let Some(backgrounds) = backgrounds {
+                let png = backgrounds.get(index).ok_or("Missing SVG PDF background")?;
+                embed_svg_pdf_background(
+                    &mut svg,
+                    png,
+                    note.export_width_pt,
+                    note.export_height_pt,
+                )?;
+            } else {
+                draw_svg_pdf_background(
+                    &mut svg,
+                    &pdf_assets[&page.relative_path],
+                    page.source_page_index,
+                    note.export_width_pt,
+                    note.export_height_pt,
+                )?;
+            }
         }
         draw_svg_text(
             &mut svg,
@@ -2175,7 +2205,7 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
         )?;
         draw_svg_images(
             &mut svg,
-            &mut bundle,
+            bundle,
             note,
             page_index,
             doc_to_pt,
@@ -2192,10 +2222,10 @@ fn write_svg(note: &NoteDocument, note_path: &Path, output_path: &Path) -> Resul
         svg.push_str("</g>");
     }
     svg.push_str("</svg>");
-    fs::write(output_path, svg)?;
-    Ok(())
+    Ok(svg.into_bytes())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn draw_svg_pdf_background(
     svg: &mut String,
     pdf: &[u8],
@@ -2243,9 +2273,21 @@ fn draw_svg_pdf_background(
         )
         .into());
     }
+    embed_svg_pdf_background(svg, &output.stdout, width, height)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn draw_svg_pdf_background(_: &mut String, _: &[u8], _: usize, _: f32, _: f32) -> Result<()> {
+    Err("Supply rendered PDF backgrounds for SVG conversion in the browser".into())
+}
+
+fn embed_svg_pdf_background(svg: &mut String, png: &[u8], width: f32, height: f32) -> Result<()> {
+    if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("Invalid SVG PDF background: expected PNG".into());
+    }
     write!(svg,
         "<image x=\"0\" y=\"0\" width=\"{width:.2}\" height=\"{height:.2}\" href=\"data:image/png;base64,{}\" preserveAspectRatio=\"none\"/>",
-        base64_encode(&output.stdout))?;
+        base64_encode(png))?;
     Ok(())
 }
 
@@ -2555,9 +2597,9 @@ fn draw_svg_list_marker(
     Ok(())
 }
 
-fn draw_svg_images(
+fn draw_svg_images<R: Read + Seek>(
     svg: &mut String,
-    bundle: &mut ZipArchive<File>,
+    bundle: &mut ZipArchive<R>,
     note: &NoteDocument,
     page_index: usize,
     doc_to_pt: f32,
@@ -2593,9 +2635,9 @@ fn draw_svg_images(
     Ok(())
 }
 
-fn draw_svg_image(
+fn draw_svg_image<R: Read + Seek>(
     svg: &mut String,
-    bundle: &mut ZipArchive<File>,
+    bundle: &mut ZipArchive<R>,
     note: &NoteDocument,
     media: &MediaImage,
     doc_to_pt: f32,
@@ -2603,13 +2645,16 @@ fn draw_svg_image(
 ) -> Result<()> {
     let path = note.bundle_root.clone() + &media.relative_path;
     let data = read_zip_entry(bundle, &path)?;
-    let (mime_type, encoded_data) = if media.crop.is_some() {
-        let image = load_media_image(&data, media)?;
-        let mut cursor = std::io::Cursor::new(Vec::new());
-        image.write_to(&mut cursor, ImageFormat::Png)?;
-        ("image/png", cursor.into_inner())
+    let mime_type = media_mime_type(&media.relative_path);
+    let crop_transform = if media.crop.is_some() {
+        let (width, height) = if let Some((width, height, _)) = jpeg_dimensions(&data) {
+            (width as u32, height as u32)
+        } else {
+            load_media_image(&data, media)?.dimensions()
+        };
+        image_crop_transform(media.crop, width, height)
     } else {
-        (media_mime_type(&media.relative_path), data)
+        None
     };
     let x = (content_inset_doc + media.x) * doc_to_pt;
     let y = media.y * doc_to_pt;
@@ -2624,7 +2669,7 @@ fn draw_svg_image(
         || media.flipped_vertical
     {
         format!(
-                " transform=\"translate({:.2} {:.2}) rotate({:.4}) scale({:.1} {:.1}) translate({:.2} {:.2})\"",
+                " transform=\"translate({:.5} {:.5}) rotate({:.6}) scale({:.1} {:.1}) translate({:.5} {:.5})\"",
                 center_x,
                 center_y,
                 media.rotation_degrees,
@@ -2636,10 +2681,33 @@ fn draw_svg_image(
     } else {
         String::new()
     };
+    if let Some([sx, _, _, sy, tx, ty]) = crop_transform {
+        write!(
+            svg,
+            concat!(
+                "<g{}><svg x=\"{:.5}\" y=\"{:.5}\" width=\"{:.5}\" height=\"{:.5}\" ",
+                "viewBox=\"0 0 1 1\" preserveAspectRatio=\"none\" overflow=\"hidden\">",
+                "<image x=\"{:.8}\" y=\"{:.8}\" width=\"{:.8}\" height=\"{:.8}\" ",
+                "href=\"data:{};base64,{}\" preserveAspectRatio=\"none\"/></svg></g>"
+            ),
+            transform,
+            x,
+            y,
+            width,
+            height,
+            tx,
+            1.0 - sy - ty,
+            sx,
+            sy,
+            mime_type,
+            base64_encode(&data)
+        )?;
+        return Ok(());
+    }
     write!(
         svg,
         concat!(
-            "<image x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" ",
+            "<image x=\"{:.5}\" y=\"{:.5}\" width=\"{:.5}\" height=\"{:.5}\" ",
             "href=\"data:{};base64,{}\" preserveAspectRatio=\"none\"{}/>"
         ),
         x,
@@ -2647,7 +2715,7 @@ fn draw_svg_image(
         width,
         height,
         mime_type,
-        base64_encode(&encoded_data),
+        base64_encode(&data),
         transform
     )?;
     Ok(())
@@ -3164,7 +3232,7 @@ fn base64_encode(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{dash_lengths, jpeg_crop_transform};
+    use super::{dash_lengths, image_crop_transform};
     use crate::converter::model::ImageCrop;
 
     #[test]
@@ -3181,9 +3249,10 @@ mod tests {
             y: 20.0,
             width: 50.0,
             height: 40.0,
+            reference_size: None,
         };
         assert_eq!(
-            jpeg_crop_transform(Some(crop), 100, 80),
+            image_crop_transform(Some(crop), 100, 80),
             Some([2.0, 0.0, 0.0, 2.0, -0.2, -0.5])
         );
     }
@@ -3195,8 +3264,57 @@ mod tests {
             y: 0.0,
             width: 100.0,
             height: 80.0,
+            reference_size: None,
         };
-        assert_eq!(jpeg_crop_transform(Some(crop), 100, 80), None);
+        assert_eq!(image_crop_transform(Some(crop), 100, 80), None);
+    }
+
+    #[test]
+    fn crop_transforms_keep_logical_scale_and_subpixel_margins() {
+        let crop = ImageCrop {
+            x: 0.125,
+            y: 0.0,
+            width: 9.875,
+            height: 5.0,
+            reference_size: Some((10.0, 5.0)),
+        };
+        let transform = image_crop_transform(Some(crop), 20, 10).unwrap();
+        assert!((transform[0] - 20.0 / 19.75).abs() < 0.000001);
+        assert!((transform[4] + 0.25 / 19.75).abs() < 0.000001);
+        let full = ImageCrop {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 5.0,
+            reference_size: Some((10.0, 5.0)),
+        };
+        assert_eq!(image_crop_transform(Some(full), 20, 10), None);
+    }
+
+    #[test]
+    fn image_cache_distinguishes_logical_coordinate_spaces() {
+        let mut media = super::MediaImage {
+            page_index: 0,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 50.0,
+            rotation_degrees: 0.0,
+            flipped_horizontal: false,
+            flipped_vertical: false,
+            relative_path: "image.png".into(),
+            z_index: 0,
+            crop: Some(ImageCrop {
+                x: 1.0,
+                y: 1.0,
+                width: 4.0,
+                height: 2.0,
+                reference_size: Some((10.0, 5.0)),
+            }),
+        };
+        let first = super::image_cache_key(b"same image", &media, false);
+        media.crop.as_mut().unwrap().reference_size = Some((20.0, 10.0));
+        assert_ne!(first, super::image_cache_key(b"same image", &media, false));
     }
 
     fn stroke(

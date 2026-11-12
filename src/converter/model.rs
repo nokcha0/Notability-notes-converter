@@ -2,7 +2,9 @@ pub(crate) const DEFAULT_TEXT_TOP_DOC: f32 = 3.0;
 pub(crate) const DEFAULT_EXPORT_WIDTH_PT: f32 = 612.0;
 pub(crate) const DEFAULT_PAGE_RATIO: f32 = 21.0 / 16.0;
 pub(crate) const DEFAULT_CONTENT_INSET_RATIO: f32 = 1.0 / 38.4;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const DEFAULT_INPUT_DIR: &str = "input";
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const DEFAULT_OUTPUT_DIR: &str = "output";
 pub(crate) const STROKE_STYLE_HIGHLIGHTER: u8 = 4;
 pub(crate) const STROKE_STYLE_PENCIL: u8 = 5;
@@ -10,13 +12,13 @@ pub(crate) const STROKE_STYLE_NOT_EXPORTED: u8 = 6;
 pub(crate) const CURVE_SMOOTHING_TENSION: f32 = 0.8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OutputFormat {
+pub enum OutputFormat {
     Pdf,
     Svg,
 }
 
 impl OutputFormat {
-    pub(crate) fn extension(self) -> &'static str {
+    pub fn extension(self) -> &'static str {
         match self {
             Self::Pdf => "pdf",
             Self::Svg => "svg",
@@ -96,6 +98,25 @@ pub(crate) struct ImageCrop {
     pub(crate) y: f32,
     pub(crate) width: f32,
     pub(crate) height: f32,
+    /// None means pixel coordinates; NTB can use a distinct logical asset size.
+    pub(crate) reference_size: Option<(f32, f32)>,
+}
+
+impl ImageCrop {
+    pub(crate) fn in_pixels(self, width: u32, height: u32) -> Self {
+        let (sx, sy) = self
+            .reference_size
+            .filter(|(w, h)| w.is_finite() && h.is_finite() && *w > 0.0 && *h > 0.0)
+            .map(|(w, h)| (width as f32 / w, height as f32 / h))
+            .unwrap_or((1.0, 1.0));
+        Self {
+            x: self.x * sx,
+            y: self.y * sy,
+            width: self.width * sx,
+            height: self.height * sy,
+            reference_size: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

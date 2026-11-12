@@ -1,14 +1,14 @@
 use crate::Result;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
-pub(crate) fn page_id_by_index(doc: &Document, zero_based_index: usize) -> Result<ObjectId> {
+pub fn page_id_by_index(doc: &Document, zero_based_index: usize) -> Result<ObjectId> {
     doc.get_pages()
         .get(&((zero_based_index + 1) as u32))
         .copied()
         .ok_or_else(|| format!("PDF page index {zero_based_index} not found").into())
 }
 
-pub(crate) fn add_form_xobject(
+pub fn add_form_xobject(
     output: &mut Document,
     source_doc: &Document,
     page_id: ObjectId,
@@ -30,11 +30,11 @@ pub(crate) fn add_form_xobject(
     Ok(output.add_object(stream))
 }
 
-pub(crate) fn page_box(doc: &Document, page_id: ObjectId) -> Result<[f32; 4]> {
+pub fn page_box(doc: &Document, page_id: ObjectId) -> Result<[f32; 4]> {
     let object = inherited_page_object(doc, page_id, b"CropBox")
         .or_else(|| inherited_page_object(doc, page_id, b"MediaBox"))
         .ok_or("page has no MediaBox")?;
-    let values = object.as_array()?;
+    let values = doc.dereference(&object)?.1.as_array()?;
     if values.len() != 4 {
         return Err("page box must contain 4 numbers".into());
     }
@@ -44,6 +44,31 @@ pub(crate) fn page_box(doc: &Document, page_id: ObjectId) -> Result<[f32; 4]> {
         values[2].as_float()?,
         values[3].as_float()?,
     ])
+}
+
+pub(crate) fn page_display_size(doc: &Document, page_id: ObjectId) -> Result<(f32, f32)> {
+    let bounds = page_box(doc, page_id)?;
+    let width = bounds[2] - bounds[0];
+    let height = bounds[3] - bounds[1];
+    if !bounds.iter().all(|n| n.is_finite()) || width <= 0.0 || height <= 0.0 {
+        return Err("PDF page has invalid bounds".into());
+    }
+    Ok(if matches!(page_rotation(doc, page_id), 90 | 270) {
+        (height, width)
+    } else {
+        (width, height)
+    })
+}
+
+fn page_rotation(doc: &Document, page_id: ObjectId) -> i64 {
+    inherited_page_object(doc, page_id, b"Rotate")
+        .and_then(|value| {
+            doc.dereference(&value)
+                .ok()
+                .and_then(|(_, object)| object.as_i64().ok())
+        })
+        .unwrap_or(0)
+        .rem_euclid(360)
 }
 
 pub(crate) fn page_render_transform(
@@ -59,10 +84,7 @@ pub(crate) fn page_render_transform(
     if !bbox.iter().all(|v| v.is_finite()) || source_width <= 0.0 || source_height <= 0.0 {
         return Err("PDF page has invalid bounds".into());
     }
-    let rotation = inherited_page_object(doc, page_id, b"Rotate")
-        .and_then(|value| value.as_i64().ok())
-        .unwrap_or(0)
-        .rem_euclid(360);
+    let rotation = page_rotation(doc, page_id);
     let (sx, sy) = if matches!(rotation, 90 | 270) {
         (width / source_height, height / source_width)
     } else {
@@ -89,7 +111,7 @@ fn inherited_page_object(doc: &Document, mut object_id: ObjectId, key: &[u8]) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{page_box, page_render_transform};
+    use super::{page_box, page_display_size, page_render_transform};
     use lopdf::{dictionary, Document};
 
     #[test]
@@ -115,5 +137,19 @@ mod tests {
             (a * 110.0 + c * 120.0 + x, b * 110.0 + d * 120.0 + y),
             (200.0, 0.0)
         );
+    }
+
+    #[test]
+    fn rotated_background_dimensions_use_the_visible_page_box() {
+        let mut pdf = Document::with_version("1.5");
+        let crop = pdf.add_object(vec![10.into(), 20.into(), 190.into(), 280.into()]);
+        let rotation = pdf.add_object(-270);
+        let parent = pdf.add_object(dictionary! { "CropBox" => crop, "Rotate" => rotation });
+        let page = pdf.add_object(dictionary! { "Parent" => parent });
+        assert_eq!(page_box(&pdf, page).unwrap(), [10., 20., 190., 280.]);
+        assert_eq!(page_display_size(&pdf, page).unwrap(), (260., 180.));
+        let transform =
+            page_render_transform(&pdf, page, page_box(&pdf, page).unwrap(), 260., 180.).unwrap();
+        assert_eq!(transform, [0., -1., 1., 0., -20., 190.]);
     }
 }

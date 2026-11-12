@@ -4,20 +4,26 @@ use super::model::{
     TextSpan, TextStyle, DEFAULT_PAGE_RATIO,
 };
 use super::util::{choose_export_width, parse_pair, parse_rect, value_f32, value_i64};
-use crate::pdf::{page_box, page_id_by_index};
+use crate::pdf::{page_display_size, page_id_by_index};
 use crate::Result;
 use image::GenericImageView;
 use lopdf::Document;
 use plist::{Dictionary, Value};
 use std::collections::BTreeMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use zip::ZipArchive;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn load_note_document(note_path: &Path) -> Result<NoteDocument> {
-    let file = File::open(note_path)?;
-    let mut bundle = ZipArchive::new(file)?;
+    read_note_document(ZipArchive::new(File::open(note_path)?)?)
+}
+
+pub(crate) fn read_note_document<R: Read + Seek>(
+    mut bundle: ZipArchive<R>,
+) -> Result<NoteDocument> {
     let entries: Vec<String> = bundle.file_names().map(str::to_owned).collect();
     let bundle_root = entries
         .iter()
@@ -103,7 +109,10 @@ fn locked_export_width(sizing_behavior: Option<&str>) -> Option<f32> {
         .filter(|width| *width > 0.0)
 }
 
-pub(crate) fn read_zip_entry(bundle: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_zip_entry<R: Read + Seek>(
+    bundle: &mut ZipArchive<R>,
+    name: &str,
+) -> Result<Vec<u8>> {
     let mut file = bundle.by_name(name)?;
     let mut data = Vec::with_capacity(file.size() as usize);
     file.read_to_end(&mut data)?;
@@ -152,23 +161,23 @@ fn choose_thumbnail_entry(entries: &[String], bundle_root: &str) -> Option<Strin
         .cloned()
 }
 
-fn thumbnail_ratio(bundle: &mut ZipArchive<File>, entry: &str) -> Result<f32> {
+fn thumbnail_ratio<R: Read + Seek>(bundle: &mut ZipArchive<R>, entry: &str) -> Result<f32> {
     let data = read_zip_entry(bundle, entry)?;
     let image = image::load_from_memory(&data)?;
     let (width, height) = image.dimensions();
     Ok(height as f32 / width as f32)
 }
 
-fn pdf_page_ratio(
-    bundle: &mut ZipArchive<File>,
+fn pdf_page_ratio<R: Read + Seek>(
+    bundle: &mut ZipArchive<R>,
     bundle_root: &str,
     page: &EmbeddedPdfPage,
 ) -> Result<f32> {
     let data = read_zip_entry(bundle, &(bundle_root.to_owned() + &page.relative_path))?;
     let doc = Document::load_mem(&data)?;
     let page_id = page_id_by_index(&doc, page.source_page_index)?;
-    let bbox = page_box(&doc, page_id)?;
-    Ok((bbox[3] - bbox[1]) / (bbox[2] - bbox[0]))
+    let (width, height) = page_display_size(&doc, page_id)?;
+    Ok(height / width)
 }
 
 fn parse_text(archive: &KeyedArchive, rich_text: &Dictionary) -> (String, Vec<TextSpan>) {
@@ -177,6 +186,14 @@ fn parse_text(archive: &KeyedArchive, rich_text: &Dictionary) -> (String, Vec<Te
         .get("stringKey")
         .and_then(|value| archive.as_text(value).ok())
         .unwrap_or_default();
+    // Apple string ranges count UTF-16 units, while renderer spans count characters.
+    let mut characters_by_unit = Vec::with_capacity(text.len() + 1);
+    for (index, ch) in text.chars().enumerate() {
+        characters_by_unit.extend(std::iter::repeat_n(index, ch.len_utf16()));
+    }
+    characters_by_unit.push(text.chars().count());
+    let character_offset =
+        |unit: f32| characters_by_unit[(unit.max(0.0) as usize).min(characters_by_unit.len() - 1)];
     let mut spans = Vec::new();
     for raw_range in archive.ns_array(attributed.get("subRangesKey")) {
         let subrange = archive.ns_dict(Some(&raw_range));
@@ -237,8 +254,8 @@ fn parse_text(archive: &KeyedArchive, rich_text: &Dictionary) -> (String, Vec<Te
             != 0;
         let lower_font_name = font_name.to_ascii_lowercase();
         spans.push(TextSpan {
-            start: start as usize,
-            length: length as usize,
+            start: character_offset(start),
+            length: character_offset(start + length).saturating_sub(character_offset(start)),
             style: TextStyle {
                 font_size,
                 font_name,
@@ -424,6 +441,7 @@ fn parse_media_images(
                     y,
                     width,
                     height,
+                    reference_size: None,
                 })
             });
         let page_index = (y / page_height_doc).floor() as usize;
@@ -438,14 +456,10 @@ fn parse_media_images(
                 .and_then(value_f32)
                 .map(normalize_rotation_degrees)
                 .unwrap_or(0.0),
-            flipped_horizontal: media
-                .get("isFlippedHorizontal")
-                .and_then(Value::as_boolean)
-                .unwrap_or(false),
-            flipped_vertical: media
-                .get("isFlippedVertical")
-                .and_then(Value::as_boolean)
-                .unwrap_or(false),
+            // Saved image snapshots are used as supplied by the official export.
+            // These legacy editor flags are not extra transforms on the snapshot.
+            flipped_horizontal: false,
+            flipped_vertical: false,
             relative_path,
             z_index: media.get("zIndex").and_then(value_i64).unwrap_or(0),
             crop,
@@ -474,6 +488,17 @@ fn parse_sticky_notes(
             .map(|value| archive.deref(value))
             .and_then(Value::as_dictionary);
         if paper_style.is_none() && paper_attrs.is_none() {
+            continue;
+        }
+        // Plain text boxes share canvas metadata with sticky notes, but have no paper.
+        let has_color = paper_style
+            .and_then(|style| style.get("paperColor"))
+            .map(|value| archive.deref(value))
+            .is_some_and(|value| {
+                value.as_dictionary().is_some()
+                    || value.as_string().is_some_and(|text| text != "$null")
+            });
+        if media.contains_key("textStore") && !has_color {
             continue;
         }
         let Some((x, y)) = media
@@ -595,6 +620,8 @@ fn parse_curves_from_spatial_hash(
     let styles = value_data(archive, spatial_hash.get("curvesstyles")).unwrap_or(&[]);
     let dash_patterns = parse_dash_patterns(archive, spatial_hash.get("dashStyles"));
     let colors = value_data(archive, spatial_hash.get("curvescolors")).unwrap_or(&[]);
+    let uuids = value_data(archive, spatial_hash.get("curveUUIDs")).unwrap_or(&[]);
+    let stroke_numbers = stroke_numbers(uuids, counts.len(), styles.len());
     let sample_counts: Vec<usize> = counts
         .iter()
         .map(|count| bezier_sample_count(*count as usize))
@@ -617,8 +644,9 @@ fn parse_curves_from_spatial_hash(
         }
         let width =
             widths.get(curve_index).copied().unwrap_or(1.0) * transform_stroke_scale(transform);
-        let style = styles.get(curve_index).copied().unwrap_or(3);
-        let dash_pattern = dash_patterns.get(&curve_index).copied();
+        let stroke = stroke_numbers[curve_index];
+        let style = styles.get(stroke).copied().unwrap_or(3);
+        let dash_pattern = dash_patterns.get(&stroke).copied();
         let rgba = parse_handwriting_color(
             colors
                 .get(curve_index * 4..curve_index * 4 + 4)
@@ -656,6 +684,29 @@ fn parse_curves_from_spatial_hash(
         ));
     }
     curves
+}
+
+// Erasing can split one stroke into several curves with the same UUID. Some
+// bundles keep styles per original stroke, others keep one style per curve.
+fn stroke_numbers(uuids: &[u8], curve_count: usize, style_count: usize) -> Vec<usize> {
+    if uuids.len() == curve_count.saturating_mul(16) && style_count != curve_count {
+        let mut stroke = 0;
+        let numbers: Vec<usize> = uuids
+            .chunks_exact(16)
+            .enumerate()
+            .map(|(index, id)| {
+                if index > 0 && id != &uuids[(index - 1) * 16..index * 16] {
+                    stroke += 1;
+                }
+                stroke
+            })
+            .collect();
+        // Only use stroke numbering when the style array confirms that encoding.
+        if numbers.last().is_some_and(|last| last + 1 == style_count) {
+            return numbers;
+        }
+    }
+    (0..curve_count).collect()
 }
 
 fn parse_group_curves(
@@ -890,7 +941,7 @@ fn parse_shape_points(kind: &str, shape: &Dictionary) -> Option<(Vec<(f32, f32)>
             close_shape_points(&mut points, shape.get("isClosed"));
             Some((points, true))
         }
-        "circle" => {
+        "circle" | "ellipse" => {
             let (center, radius_x, radius_y) = circle_geometry(shape)?;
             Some((ellipse_bezier_points(center, radius_x, radius_y), false))
         }
@@ -1174,6 +1225,159 @@ fn unpack_i32(archive: Option<&KeyedArchive>, value: Option<&Value>) -> Vec<i32>
 mod tests {
     use super::locked_export_width;
 
+    fn dictionary(entries: Vec<(&str, plist::Value)>) -> plist::Value {
+        plist::Value::Dictionary(
+            entries
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn erased_fragments_keep_their_original_stroke_style_and_dash() {
+        use plist::{Dictionary, Value};
+        let mut patterns = Vec::new();
+        dictionary(vec![(
+            "objectPatterns",
+            dictionary(vec![
+                ("1", dictionary(vec![("pattern", Value::Integer(2.into()))])),
+                ("2", dictionary(vec![("pattern", Value::Integer(3.into()))])),
+            ]),
+        )])
+        .to_writer_binary(&mut patterns)
+        .unwrap();
+        let hash: Dictionary = [
+            (
+                "curvesnumpoints",
+                Value::Data([2i32; 4].into_iter().flat_map(i32::to_le_bytes).collect()),
+            ),
+            (
+                "curvespoints",
+                Value::Data(
+                    [
+                        10f32, 10., 20., 20., 30., 30., 40., 40., 50., 50., 60., 60., 70., 70.,
+                        80., 80.,
+                    ]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+                ),
+            ),
+            ("curvesstyles", Value::Data(vec![3, 4, 5])),
+            (
+                "curveUUIDs",
+                Value::Data([1u8, 2, 2, 3].into_iter().flat_map(|id| [id; 16]).collect()),
+            ),
+            ("dashStyles", Value::Data(patterns)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        let curves = super::parse_curves_from_spatial_hash(None, &hash, 100., None);
+        assert_eq!(
+            curves.iter().map(|c| c.style).collect::<Vec<_>>(),
+            [3, 4, 4, 5]
+        );
+        assert_eq!(
+            curves.iter().map(|c| c.dash_pattern).collect::<Vec<_>>(),
+            [None, Some(2), Some(2), Some(3)]
+        );
+        let ids: Vec<u8> = [1u8, 2, 2, 3].into_iter().flat_map(|id| [id; 16]).collect();
+        assert_eq!(super::stroke_numbers(&ids, 4, 4), [0, 1, 2, 3]);
+        assert_eq!(super::stroke_numbers(&ids, 4, 1), [0, 1, 2, 3]);
+        assert_eq!(super::stroke_numbers(&[], 4, 3), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn apple_text_ranges_count_surrogate_pairs_as_two_units() {
+        use plist::{Dictionary, Value};
+        let rich: Dictionary = [(
+            "attributedString".to_owned(),
+            dictionary(vec![
+                ("stringKey", Value::String("A😀B".into())),
+                (
+                    "subRangesKey",
+                    dictionary(vec![(
+                        "NS.objects",
+                        Value::Array(vec![dictionary(vec![
+                            ("subRangeRangeKey", Value::String("{3, 1}".into())),
+                            (
+                                "subRangeFontKey",
+                                dictionary(vec![(
+                                    "NSFontNameAttribute",
+                                    Value::String("Helvetica-Bold".into()),
+                                )]),
+                            ),
+                        ])]),
+                    )]),
+                ),
+            ]),
+        )]
+        .into_iter()
+        .collect();
+        let archive = super::KeyedArchive {
+            objects: vec![],
+            root: Value::Dictionary(rich.clone()),
+        };
+        let (text, spans) = super::parse_text(&archive, &rich);
+        assert_eq!(text, "A😀B");
+        assert_eq!((spans[0].start, spans[0].length), (2, 1));
+        assert!(spans[0].style.bold);
+    }
+
+    #[test]
+    fn plain_text_boxes_do_not_gain_a_yellow_sticky_background() {
+        use plist::{Dictionary, Value};
+        let media = |color| {
+            let mut entries = vec![
+                ("textStore", dictionary(vec![])),
+                ("documentOrigin", Value::String("{10, 20}".into())),
+                ("unscaledContentSize", Value::String("{100, 100}".into())),
+            ];
+            let paper = if color {
+                vec![("paperColor", Value::String("1,0,0,1".into()))]
+            } else {
+                vec![]
+            };
+            entries.push(("paperStyleObject", dictionary(paper)));
+            dictionary(entries)
+        };
+        let rich: Dictionary = [(
+            "mediaObjects".to_owned(),
+            dictionary(vec![(
+                "NS.objects",
+                Value::Array(vec![media(false), media(true)]),
+            )]),
+        )]
+        .into_iter()
+        .collect();
+        let archive = super::KeyedArchive {
+            objects: vec![],
+            root: Value::Dictionary(rich.clone()),
+        };
+        let backgrounds = super::parse_sticky_notes(&archive, &rich, 900.);
+        assert_eq!(backgrounds.len(), 1);
+        assert_eq!(backgrounds[0].color, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn ellipse_shape_alias_keeps_curved_geometry() {
+        use plist::Value;
+        let shape = dictionary(vec![(
+            "rect",
+            Value::Array(vec![
+                Value::Array(vec![Value::Real(10.), Value::Real(20.)]),
+                Value::Array(vec![Value::Real(80.), Value::Real(40.)]),
+            ]),
+        )]);
+        let shape = shape.as_dictionary().unwrap();
+        let circle = super::parse_shape_points("circle", shape).unwrap();
+        let ellipse = super::parse_shape_points("ellipse", shape).unwrap();
+        assert_eq!(circle, ellipse);
+        assert!(!ellipse.1);
+    }
+
     #[test]
     fn reads_locked_export_width() {
         assert_eq!(
@@ -1218,6 +1422,69 @@ mod tests {
             assert_eq!(curves[1].points.len(), points.len());
             assert_eq!(curves[1].points[0], (10.0, -10.0));
             assert_eq!(curves[1].points.last(), Some(&(10.0, 10.0)));
+        }
+    }
+
+    #[test]
+    fn exported_snapshots_do_not_receive_editor_flips_a_second_time() {
+        use super::{Dictionary, KeyedArchive, Value};
+        fn dict(entries: Vec<(&str, Value)>) -> Value {
+            Value::Dictionary(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.to_owned(), value))
+                    .collect(),
+            )
+        }
+        let mut objects = vec![Value::String("$null".into())];
+        for (horizontal, vertical) in [(true, false), (false, true), (true, true)] {
+            objects.push(dict(vec![
+                ("documentOrigin", Value::String("{10, 20}".into())),
+                ("unscaledContentSize", Value::String("{100, 200}".into())),
+                ("rotationDegrees", Value::Real(std::f64::consts::FRAC_PI_4)),
+                ("isFlippedHorizontal", Value::Boolean(horizontal)),
+                ("isFlippedVertical", Value::Boolean(vertical)),
+                (
+                    "figure",
+                    dict(vec![(
+                        "FigureBackgroundObjectKey",
+                        dict(vec![(
+                            "kImageObjectSnapshotKey",
+                            dict(vec![(
+                                "relativePath",
+                                Value::String("Images/snapshot.jpg".into()),
+                            )]),
+                        )]),
+                    )]),
+                ),
+            ]));
+        }
+        let rich_text: Dictionary = [(
+            "mediaObjects".to_owned(),
+            dict(vec![(
+                "NS.objects",
+                Value::Array(
+                    (1..=3)
+                        .map(|index| Value::Uid(plist::Uid::new(index)))
+                        .collect(),
+                ),
+            )]),
+        )]
+        .into_iter()
+        .collect();
+        let archive = KeyedArchive {
+            objects,
+            root: Value::Dictionary(rich_text.clone()),
+        };
+        let images = super::parse_media_images(&archive, &rich_text, 900.0);
+        assert_eq!(images.len(), 3);
+        for image in images {
+            assert!(!image.flipped_horizontal && !image.flipped_vertical);
+            assert_eq!(
+                (image.x, image.y, image.width, image.height),
+                (10.0, 20.0, 100.0, 200.0)
+            );
+            assert!((image.rotation_degrees - 45.0).abs() < 0.0001);
         }
     }
 }

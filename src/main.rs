@@ -1,9 +1,6 @@
 #[macro_use]
 extern crate lopdf;
 
-mod converter;
-mod pdf;
-
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use serde::Deserialize;
@@ -13,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-use crate::pdf::{add_form_xobject, page_box, page_id_by_index};
+use notability_converter::pdf::{add_form_xobject, page_box, page_id_by_index};
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -42,7 +39,7 @@ fn dispatch() -> Result<()> {
     if args.len() == 1 && args[0].ends_with(".json") {
         run_pdfmerge(Path::new(&args[0]))
     } else {
-        converter::run_cli(args)
+        notability_converter::run_cli(args)
     }
 }
 
@@ -52,7 +49,12 @@ fn run_pdfmerge(manifest_path: &Path) -> Result<()> {
     let mut loaded_docs: BTreeMap<PathBuf, Document> = BTreeMap::new();
     let mut max_id = 1;
 
-    load_pdf_into_output(&manifest.overlay, &mut output, &mut loaded_docs, &mut max_id)?;
+    load_pdf_into_output(
+        &manifest.overlay,
+        &mut output,
+        &mut loaded_docs,
+        &mut max_id,
+    )?;
     for page in &manifest.pages {
         if let Some(base_pdf) = &page.base_pdf {
             load_pdf_into_output(base_pdf, &mut output, &mut loaded_docs, &mut max_id)?;

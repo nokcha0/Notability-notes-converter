@@ -4,7 +4,10 @@ use super::model::{
 };
 use super::note::read_zip_entry;
 use crate::Result;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
+use std::io::{Read, Seek};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use zip::ZipArchive;
 
@@ -23,9 +26,12 @@ const EVENT_SHAPE: u8 = 18;
 const EVENT_MEDIA: u8 = 22;
 const NTB_PENCIL_WIDTH_SCALE: f32 = 0.45 / 0.68;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn load_ntb_document(path: &Path) -> Result<NoteDocument> {
-    let file = File::open(path)?;
-    let mut bundle = ZipArchive::new(file)?;
+    read_ntb_document(ZipArchive::new(File::open(path)?)?)
+}
+
+pub(crate) fn read_ntb_document<R: Read + Seek>(mut bundle: ZipArchive<R>) -> Result<NoteDocument> {
     let bytes = read_zip_entry(&mut bundle, "noteBundle")?;
     let flat = FlatBuffer::new(&bytes);
     let root = flat.root_table().ok_or("Invalid .ntb noteBundle root")?;
@@ -335,10 +341,10 @@ fn parse_media_image(
             return None;
         }
         if logical_asset_size.is_some_and(|(asset_width, asset_height)| {
-            values[0] <= 0.5
-                && values[1] <= 0.5
-                && values[0] + values[2] >= asset_width - 0.5
-                && values[1] + values[3] >= asset_height - 0.5
+            values[0] == 0.0
+                && values[1] == 0.0
+                && values[2] == asset_width
+                && values[3] == asset_height
         }) {
             return None;
         }
@@ -347,6 +353,7 @@ fn parse_media_image(
             y: values[1],
             width: values[2],
             height: values[3],
+            reference_size: logical_asset_size,
         })
     });
     Some(MediaImage {
