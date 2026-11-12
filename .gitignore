@@ -1,2 +1,8 @@
 /example
 /target
+/output.backups/
+/web/dist/
+/web/node_modules/
+/web/test-results/
+/web/playwright-report/
+/_site/

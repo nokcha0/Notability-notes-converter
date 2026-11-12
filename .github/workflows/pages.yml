@@ -1,0 +1,64 @@
+name: Browser converter
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --target wasm32-unknown-unknown
+          rustup default 1.95.0
+      - name: Install build tools
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.118 --locked
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+      - name: Test the engine
+        run: cargo test --locked --workspace -- --include-ignored
+      - name: Build the site
+        run: sh web/build.sh
+      - name: Test the browser
+        working-directory: web
+        run: |
+          npm test
+          npx playwright install --with-deps chromium
+          npm run test:browser
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: web/dist
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

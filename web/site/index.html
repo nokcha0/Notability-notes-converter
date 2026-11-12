@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Convert Notability notes to PDF or SVG. Preview and download locally in your browser.">
+    <meta name="theme-color" content="#090909">
+    <title>Notability notes converter</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="style.css">
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <header class="masthead">
+      <h1>Notability notes converter</h1>
+    </header>
+    <main>
+      <section class="converter" aria-label="Convert notes">
+        <label class="upload" id="drop" for="files">
+          <input type="file" id="files" accept=".note,.ntb,.zip" multiple aria-label="Choose notes or ZIP archives">
+          <strong>Drop files here</strong>
+          <span class="file-types">.note, .ntb, or a ZIP of notes</span>
+          <span class="choose-files">Choose files</span>
+        </label>
+        <div class="conversion-options">
+          <label class="format-label" for="format">Convert to <select id="format"><option value="pdf">PDF</option><option value="svg">SVG</option></select></label>
+        </div>
+        <p id="message" role="status" hidden></p>
+        <section id="results-section" aria-label="Conversions" hidden>
+          <div class="list-heading"><h2>Files <span id="file-count"></span></h2><button type="button" id="clear" class="text-button">Clear</button></div>
+          <progress id="progress" aria-label="Conversion progress" hidden></progress>
+          <ul id="results"></ul>
+          <button type="button" id="download-all" class="download-all" hidden>Download all · ZIP</button>
+        </section>
+      </section>
+      <section class="preview" aria-label="PDF preview">
+        <div id="preview-empty" class="preview-empty">PDF preview</div>
+        <div id="viewer" hidden>
+          <div class="toolbar">
+            <div class="preview-details">
+              <span id="preview-name" class="preview-name"></span>
+              <span id="page-count" class="page-count" role="status"></span>
+            </div>
+            <div class="preview-actions">
+              <select id="zoom" aria-label="Zoom"><option value="fit">Fit width</option><option value="1">100%</option><option value="1.5">150%</option><option value="2">200%</option></select>
+              <a id="download-preview" class="download-preview" download>Download PDF</a>
+            </div>
+          </div>
+          <p id="viewer-message" role="status" hidden></p>
+          <div id="page-area" class="page-area" tabindex="0" role="region" aria-label="PDF pages">
+            <div id="pdf-pages" class="pdf-pages"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+    <footer class="site-footer">
+      <p class="privacy">Conversion runs locally in your browser. Your files are never sent to a server.</p>
+      <a class="source" href="https://github.com/nokcha0/Notability-notes-converter">github.com/nokcha0/Notability-notes-converter</a>
+    </footer>
+    <noscript>JavaScript is required to convert notes.</noscript>
+  </body>
+</html>

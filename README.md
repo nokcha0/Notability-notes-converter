@@ -6,17 +6,21 @@ I originally made this for personal use because I couldn't find a converter onli
 
 Note: output is not perfectly identical to Notability’s official export. Some details, such as Apple-specific fonts and exact text layout are approximated, but for most notes this converter works pretty well.
 
-## Where is this useful?
-
-- Convert `.note` and `.ntb` files to other formats in bulk (high speed is a plus)
-- View `.note` and `.ntb` files on a machine that does not have Notability installed
-- Switch platforms by converting notes to `.svg` (SVGs can be imported into other note-taking apps as editable files)
-
 ## How to use
+
+### In your browser
+
+Link: https://nokcha0.github.io/Notability-notes-converter/
+
+Conversion happens on your browser, and your files are not sent to a server.
+
+### From the command line
 
 Requirement: [Rust](https://rust-lang.org/tools/install/)
 
 SVG output with imported PDF backgrounds also needs Poppler's `pdftoppm` in `PATH`. PDF output does not need Poppler.
+
+First, clone the repository.
 
 Put your exported `.note` and `.ntb` files in `input/`, then run this from the repository root:
 
@@ -26,8 +30,6 @@ cargo run
 
 This converts everything under `input/` into `output/`.
 Nested folder structures are preserved.
-
-Input and output folders must be separate and must not contain each other. Files are converted in a temporary folder first. A collision or conversion failure leaves existing output unchanged. When output is replaced successfully, the previous folder is kept in a sibling backup folder. Its location is printed after conversion.
 
 Example:
 
@@ -93,6 +95,8 @@ The attributed string stores plain text in `stringKey` and style runs in `subRan
 - underline, strikethrough, and baseline offset in `subRangeOtherAttributesKey`
 - list/checklist metadata such as `indent-level`, `indent-decoration-style`, `indent-decoration-number`, and `checklist-checked`
 
+Style ranges count UTF-16 units. Convert them to character offsets so styles after emoji and other surrogate pairs stay aligned. Plain text boxes can share paper metadata with sticky notes; only add their paper background when a color is stored.
+
 To convert text, reconstruct a per-character style map from the ranges, then lay out the text in document coordinates. This is the least exact part of the format because Notability's native font shaping and wrapping are not stored as final glyph positions.
 
 Images are `mediaObjects` with nested figure/background/snapshot objects pointing to files in `Images/`. Important fields are:
@@ -100,11 +104,11 @@ Images are `mediaObjects` with nested figure/background/snapshot objects pointin
 - `documentOrigin`: document-space position
 - `unscaledContentSize`: displayed size
 - `rotationDegrees`: rotation; some files store radians despite the name
-- `isFlippedHorizontal` and `isFlippedVertical`: independent mirror flags
+- `isFlippedHorizontal` and `isFlippedVertical`: editor mirror state, not extra flips for saved snapshots
 - `FigureCropRectKey`: crop rectangle in source-image pixels
 - `zIndex`: layer order
 
-To convert images, read the referenced asset from `Images/`, crop it if `FigureCropRectKey` exists, then place it at `documentOrigin` with size, rotation, and flips applied around the displayed image center. If a referenced RGB JPEG is uncropped or the crop covers the entire source image, it can be embedded directly in the output PDF instead of being decoded and re-encoded.
+To convert images, use the referenced snapshot from `Images/` as supplied, then place it at `documentOrigin` with its stored size and rotation. Apply `FigureCropRectKey` as a clip around the source image. Keep fractional boundaries instead of rounding them to pixels. RGB JPEGs can be embedded directly, including when cropped, without being decoded and re-encoded.
 
 Imported PDF backgrounds are described by `richText -> pageLayoutArray`. Each entry maps:
 
@@ -113,6 +117,8 @@ Imported PDF backgrounds are described by `richText -> pageLayoutArray`. Each en
 - source page index inside that PDF
 
 To convert a PDF-backed page, use the source PDF page as the base layer, scale it to the reconstructed output page box, then draw the note overlays above it.
+
+Use the visible PDF crop box and inherited page rotation when finding the page ratio. A quarter-turn swaps its width and height.
 
 Handwriting is stored under `richText -> Handwriting Overlay -> SpatialHash`. The main stroke payloads are little-endian binary arrays:
 
@@ -123,6 +129,7 @@ Handwriting is stored under `richText -> Handwriting Overlay -> SpatialHash`. Th
 - `curvesfractionalwidths`: width multipliers as `f32`
 - `curvescolors`: raw RGBA bytes
 - `curvesstyles`: tool/style ids
+- `curveUUIDs`: original stroke ids; erased fragments can share an id
 - `dashStyles`: dash/dot pattern metadata keyed by curve index
 - `groupsArrays`: nested stroke groups with transforms
 - `shapes`: simple shape strokes
@@ -133,12 +140,14 @@ Polygon vertices can also have a `1 + 3n` point count. Keep them as straight edg
 
 Dash and dot patterns live in `dashStyles -> objectPatterns -> <curve-index> -> pattern`. Keep the original curve index when attaching dash metadata; filtering or reordering curves too early can assign dotted styles to the wrong stroke.
 
+Some files store styles and dash patterns per original stroke instead of per curve. When the style count matches the stroke count, use `curveUUIDs` to give erased fragments the same style.
+
 Grouped handwriting in `groupsArrays` has its own nested archive data plus a transform. Apply the group transform to stroke coordinates. Scale stroke width by the transform as well, otherwise grouped strokes render too thick or too thin.
 
 Shape strokes are separate from normal raw curves:
 
 - `square`, `triangle`, and `polygon` use explicit point lists
-- `circle` uses `rotatedRect` or `rect`
+- `circle` and `ellipse` use `rotatedRect` or `rect`
 - `line` uses `startPt` and `endPt`; curved lines also use `controlPoint1` / `controlPoint2`
 - dashed/dotted shapes use `appearance -> dashStyle -> pattern`
 - `partialshape` represents partially erased shape/line fragments; use its `strokePath` outline as a filled path to preserve the erased gap size
@@ -150,7 +159,7 @@ Important limitations when converting:
 - text layout is heuristic because exact Notability glyph shaping is not fully encoded
 - raw partial erase behavior is only partly understood, but `partialshape` fragments preserve erased size for partially erased shapes/lines
 - highlighter dotted/dashed strokes can differ from Notability's exported PDF because the export may use filled fragments instead of native dash arrays
-- image rotation, crop, and horizontal/vertical flips are separate fields and all must be applied
+- image snapshots already have their exported orientation; legacy editor flip flags should not be applied again. Keep the snapshot rotation and crop
 
 ## Analysis of the `.ntb` file format
 
@@ -189,6 +198,8 @@ Type 20 events contain lists of related event ids. They do not act as eraser mas
 
 Images refer to files under `assets/` by their content hash. Their events store a MIME type, logical asset size, page, position, displayed size, rotation in radians, and an optional crop rectangle. Crop values use logical asset coordinates and do not always match the pixel dimensions of the stored image.
 
+Scale crop coordinates from the logical asset size to the actual pixel size. Keep fractional crop boundaries by clipping the original image, rather than rounding to a new bitmap. PDF images and their transparency masks use interpolation to match the reference export. SVG images keep precise positions, sizes, and clipped viewports.
+
 For a bundle with one PDF asset under `assets/`, the converter uses all source pages in their original order as backgrounds, including pages without handwriting. PDF output preserves the source page content, crop, and rotation. SVG output embeds rendered backgrounds while keeping note strokes as SVG paths.
 
 Multiple PDF assets and reordered source pages still need explicit page mapping. The converter reports an error for multiple PDF assets rather than choosing one. The supplied example has no PDF backgrounds or positioned text boxes, so these paths are tested with generated fixtures.
@@ -200,3 +211,7 @@ The main differences from `.note` are:
 - `.note` uses one continuous vertical coordinate space; `.ntb` events contain explicit page references
 - `.note` media uses paths under `Images/`; `.ntb` media uses content hashes under `assets/`
 - `.note` handwriting uses parallel binary arrays; `.ntb` stores a compact path inside each ink event
+
+## Credits
+
+Thanks to [tim4431's fork](https://github.com/tim4431/Notability-notes-converter) for the browser converter approach and additional format findings.

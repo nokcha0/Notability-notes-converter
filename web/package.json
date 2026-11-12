@@ -1,0 +1,16 @@
+{
+  "name": "notability-converter-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "sh build.sh",
+    "test": "node --test tests/*.test.js",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "pdfjs-dist": "6.5.438"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1"
+  }
+}
